@@ -1,17 +1,32 @@
-# Build stage
-FROM golang:1.22 as build
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o server .
+# syntax=docker/dockerfile:1.7
 
+############################
+# Build stage
+############################
+FROM golang:1.22 AS build
+WORKDIR /app
+
+# Speed + reliability for module fetches
+ENV GOPROXY=https://proxy.golang.org,direct
+
+# Copy mod files first to cache downloads
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# Copy the rest and build
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -o /server .
+
+############################
 # Run stage (Cloud Run)
+############################
 FROM gcr.io/distroless/base-debian12
 ENV PORT=8080
-ENV API_KEY=changeme
 WORKDIR /srv
-COPY --from=build /app/server /srv/server
+COPY --from=build /server /srv/server
+USER nonroot:nonroot
 EXPOSE 8080
-USER nonroot
-CMD ["/srv/server"]
+ENTRYPOINT ["/srv/server"]

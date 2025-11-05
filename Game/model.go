@@ -5,70 +5,86 @@ package game
 type Phase string
 
 const (
-	Waiting  Phase = "WAITING"
-	Preflop  Phase = "PREFLOP"
-	Flop     Phase = "FLOP"
-	Turn     Phase = "TURN"
-	River    Phase = "RIVER"
-	Showdown Phase = "SHOWDOWN"
+	WAITING  Phase = "WAITING"
+	PREFLOP  Phase = "PREFLOP"
+	FLOP     Phase = "FLOP"
+	TURN     Phase = "TURN"
+	RIVER    Phase = "RIVER"
+	SHOWDOWN Phase = "SHOWDOWN"
 )
 
-// ---------- Cards ----------
-type Suit rune
+// ---------- Actions ----------
+type Action string
 
 const (
-	Spade Suit = '♠'
-	Heart Suit = '♥'
-	Diam  Suit = '♦'
-	Club  Suit = '♣'
+	CHECK Action = "CHECK"
+	CALL  Action = "CALL"
+	RAISE Action = "RAISE"
+	FOLD  Action = "FOLD"
+)
+
+// ---------- Card / Suits ----------
+type Suit string
+
+const (
+	HEART   Suit = "HEART"
+	DIAMOND Suit = "DIAMOND"
+	CLUB    Suit = "CLUB"
+	SPADE   Suit = "SPADE"
 )
 
 type Card struct {
-	Rank string // "A","K","Q","J","10","9"...,"2","?"
-	Suit Suit
+	Rank string `json:"rank"`
+	Suit Suit   `json:"suit"`
 }
 
-// ---------- Players ----------
+// ---------- Player ----------
+type PlayerState string
+
+const (
+	INHAND PlayerState = "INHAND"
+	FOLDED PlayerState = "FOLDED"
+	ALLIN  PlayerState = "ALLIN"
+)
+
 type Player struct {
-	ID     string
-	Stack  int  // remaining chips
-	In     bool // seated
-	Folded bool
+	ID          string  `json:"id"`
+	Chips       int     `json:"chips"`
+	Action      Action  `json:"action"`
+	Cards       [2]Card `json:"cards"`
+	playerState PlayerState
 }
 
 // ---------- Table ----------
-type TableState struct {
-	ID         string
-	Phase      Phase
-	Pot        int
-	Board      []Card
-	Order      []string // seat order (player IDs)
-	ToActIdx   int      // index into Order (active only)
-	Players    map[string]*Player
-	Hands      map[string][2]Card // dealt hole cards
-	MaxPlayers int                // cap per table (e.g., 100)
-
-	StartStack int            // initial stack per join (e.g., 5000)
-	CurrentBet int            // highest committed amount this round
-	Bets       map[string]int // per-player committed this round
-	MinPlayers int            // optional: gate START if < MinPlayers
+type Table struct {
+	ID        string    `json:"id"`
+	Players   []*Player `json:"players"` // pointers for in-place updates
+	Phase     Phase     `json:"phase"`
+	CardStack []Card    `json:"cardStack"` // face-down deck
+	CardOpen  []Card    `json:"cardOpen"`  // community cards
 }
 
-// ---------- Actions ----------
-type KindAction string
+// ---------- Helpers (optional but handy) ----------
+func NewTable(id string) *Table {
+	return &Table{
+		ID:        id,
+		Players:   make([]*Player, 0),
+		Phase:     WAITING,
+		CardStack: make([]Card, 0),
+		CardOpen:  make([]Card, 0, 5),
+	}
+}
 
-const (
-	JOIN  KindAction = "JOIN"
-	LEAVE KindAction = "LEAVE"
-	FOLD  KindAction = "FOLD"
-	CHECK KindAction = "CHECK"
-	CALL  KindAction = "CALL"
-	RAISE KindAction = "RAISE"
-	START KindAction = "START"
-)
+func (t *Table) AddPlayer(p *Player) {
+	t.Players = append(t.Players, p)
+}
 
-type Action struct {
-	PlayerID string
-	Kind     KindAction
-	Amount   int // for RAISE
+func (t *Table) ResetHand() {
+	t.Phase = PREFLOP
+	t.CardOpen = t.CardOpen[:0]
+	// keep CardStack management in your dealer/shuffler code
+	for _, p := range t.Players {
+		p.Action = ""
+		p.Cards = [2]Card{}
+	}
 }
