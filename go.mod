@@ -1,4 +1,4 @@
-module github.com/dtaing11/Texas-HoldEm-Infrastructure.git
+module github.com/dtaing11/Texas-HoldEm-Infrastructure
 
 go 1.23.4
 

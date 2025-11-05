@@ -17,7 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	// Your game engine & model
-	"github.com/dtaing11/Texas-HoldEm-Infrastructure.git/game"
+	"github.com/dtaing11/Texas-HoldEm-Infrastructure/game"
 )
 
 var (

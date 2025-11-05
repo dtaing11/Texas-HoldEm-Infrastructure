@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/dtaing11/Texas-HoldEm-Infrastructure.git/connection"
-	"github.com/dtaing11/Texas-HoldEm-Infrastructure.git/game"
+	"github.com/dtaing11/Texas-HoldEm-Infrastructure/connection"
+	"github.com/dtaing11/Texas-HoldEm-Infrastructure/game"
 )
 
 func main() {
