@@ -148,6 +148,16 @@ func (e *Engine) leftOf(idx int) int { return e.nextIdx(idx) }
 
 // ---------- Hand lifecycle ----------
 
+func (e *Engine) ToActIndex() int {
+	if e.Table == nil {
+		return -1
+	}
+	if e.toActIdx < 0 || e.toActIdx >= len(e.Table.Players) {
+		return -1
+	}
+	return e.toActIdx
+}
+
 func (e *Engine) StartHand() error {
 	// Need at least 2 players with chips
 	count := 0
@@ -341,13 +351,9 @@ func (e *Engine) Act(req ActRequest) error {
 	}
 
 	// If betting round naturally closes, advance street (and maybe showdown)
-	for e.bettingRoundComplete() {
+	if e.bettingRoundComplete() {
 		if err := e.advanceStreet(); err != nil {
 			return err
-		}
-		// If hand ended (showdown/only one left), stop processing further
-		if e.Table.Phase == WAITING {
-			break
 		}
 	}
 	return nil
@@ -641,7 +647,7 @@ const (
 
 var rankVal = map[string]int{
 	"2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
-	"T": 10, "J": 11, "Q": 12, "K": 13, "A": 14,
+	"10": 10, "J": 11, "Q": 12, "K": 13, "A": 14,
 }
 
 func (s *SimpleEvaluator) Rank7(hole [2]Card, board []Card) HandRank {

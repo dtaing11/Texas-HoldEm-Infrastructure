@@ -24,10 +24,17 @@ var (
 	ErrUnauthorized = errors.New("unauthorized")
 )
 
+// starting chip stack for new players
+const (
+	defaultChips = 1000
+)
+
 // ------------ Public Server ------------
 
+// Server holds global config and all table hubs.
 type Server struct {
-	apiKey string
+	apiKey       string
+	hostStartKey string // secret that allows a client to become "host"
 
 	// tableID -> hub
 	hubsMu sync.RWMutex
@@ -40,10 +47,17 @@ type Server struct {
 }
 
 // NewServer constructs a WebSocket server. apiKey is required for auth.
+// Host start key is read from env START_KEY (default: "supersecret").
 func NewServer(apiKey string) *Server {
+	startKey := os.Getenv("START_KEY")
+	if strings.TrimSpace(startKey) == "" {
+		startKey = "supersecret"
+	}
+
 	s := &Server{
-		apiKey: apiKey,
-		hubs:   make(map[string]*hub),
+		apiKey:       apiKey,
+		hostStartKey: startKey,
+		hubs:         make(map[string]*hub),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -142,12 +156,23 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Host detection: needs correct startKey.
+	isHost := false
+	startKey := firstNonEmpty(
+		r.URL.Query().Get("startKey"),
+		r.Header.Get("X-Start-Key"),
+	)
+	if startKey != "" && startKey == s.hostStartKey {
+		isHost = true
+	}
+
 	client := &client{
 		playerID: playerID,
 		h:        h,
 		conn:     conn,
 		send:     make(chan []byte, 64),
 		log:      s.log,
+		isHost:   isHost,
 	}
 
 	// register & spawn pumps
@@ -199,8 +224,11 @@ func (h *hub) run() {
 		case c := <-h.register:
 			h.mu.Lock()
 			h.clients[c] = struct{}{}
+			// Ensure this player exists with chips on the table.
+			h.ensurePlayer(c.playerID)
 			h.mu.Unlock()
-			h.log.Printf("client join: table=%s player=%s", h.tableID, c.playerID)
+
+			h.log.Printf("client join: table=%s player=%s host=%v", h.tableID, c.playerID, c.isHost)
 			h.pushStateTo(c)
 
 		case c := <-h.unregister:
@@ -213,7 +241,7 @@ func (h *hub) run() {
 			h.log.Printf("client leave: table=%s player=%s", h.tableID, c.playerID)
 
 		case msg := <-h.broadcast:
-			h.mu.RLock()
+			h.mu.Lock()
 			for c := range h.clients {
 				select {
 				case c.send <- msg:
@@ -223,13 +251,30 @@ func (h *hub) run() {
 					delete(h.clients, c)
 				}
 			}
-			h.mu.RUnlock()
+			h.mu.Unlock()
 
 		case <-ticker.C:
 			// periodic state push (optional); can be removed if purely event-driven
 			h.pushState()
 		}
 	}
+}
+
+// ensurePlayer seats a player on the table if they don't already exist.
+func (h *hub) ensurePlayer(playerID string) *game.Player {
+	for _, p := range h.table.Players {
+		if p != nil && p.ID == playerID {
+			return p
+		}
+	}
+	p := &game.Player{
+		ID:    playerID,
+		Chips: defaultChips,
+	}
+	h.table.AddPlayer(p)
+	h.log.Printf("new player seated: table=%s player=%s chips=%d",
+		h.tableID, playerID, p.Chips)
+	return p
 }
 
 func (h *hub) pushState() {
@@ -260,11 +305,13 @@ func (h *hub) pushStateTo(c *client) {
 	c.sendJSON(payload)
 }
 
+// peekToActIdx asks the engine whose turn it is.
+// Requires game.Engine.ToActIndex() int to be implemented.
 func (h *hub) peekToActIdx() int {
-	// not exported from Engine; if you made it private, you can expose a getter.
-	// For now we reflect it indirectly by finding whose turn it is in your own UI logic.
-	// Returning -1 means "unknown".
-	return -1
+	if h.engine == nil {
+		return -1
+	}
+	return h.engine.ToActIndex()
 }
 
 func (h *hub) broadcastJSON(v any) {
@@ -275,12 +322,19 @@ func (h *hub) broadcastJSON(v any) {
 func (h *hub) handleClientMessage(c *client, in clientMessage) {
 	switch in.Type {
 	case "join":
+
 		// No-op: presence is already established. Could re-send state.
 		h.pushStateTo(c)
 
 	case "start_hand":
+		// Only host can start a hand
+		if !c.isHost {
+			c.sendJSON(serverMessage{Type: "error", Error: "only host can start hand"})
+			return
+		}
+
 		if err := h.engine.StartHand(); err != nil {
-			h.broadcastJSON(serverMessage{Type: "error", Error: err.Error()})
+			c.sendJSON(serverMessage{Type: "error", Error: err.Error()})
 			return
 		}
 		h.pushState()
@@ -330,6 +384,7 @@ func (h *hub) handleClientMessage(c *client, in clientMessage) {
 
 type client struct {
 	playerID string
+	isHost   bool
 	h        *hub
 	conn     *websocket.Conn
 	send     chan []byte
@@ -434,6 +489,7 @@ type statePayload struct {
 // =====================================================
 
 // Convenience helper to start an HTTP server that Cloud Run can use.
+// (Not used in your simple main.go, but useful for Cloud Run.)
 func StartHTTPServer(ctx context.Context, s *Server) error {
 	port := os.Getenv("PORT")
 	if port == "" {

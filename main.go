@@ -2,37 +2,43 @@
 package main
 
 import (
-	"context"
 	"log"
+	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/dtaing11/Texas-HoldEm-Infrastructure/connection"
 	"github.com/dtaing11/Texas-HoldEm-Infrastructure/game"
 )
 
 func main() {
+	// General auth key for all WS clients
 	apiKey := os.Getenv("API_KEY")
 	if apiKey == "" {
 		apiKey = "dev" // local testing
 	}
 
-	// Build one table & engine so /ws has something to serve.
-	t := game.NewTable("table-1")
-	t.AddPlayer(&game.Player{ID: "p1", Chips: 1000})
-	t.AddPlayer(&game.Player{ID: "p2", Chips: 1000})
-	t.AddPlayer(&game.Player{ID: "p3", Chips: 1000})
-	e := game.NewEngine(t, 5, 10)
+	// Special key that is allowed to start a game (host key)
+	startKey := os.Getenv("START_KEY")
+	if startKey == "" {
+		startKey = "host-dev" // local testing
+	}
 
-	// Create WS server (registers /healthz and /ws)
+	// One empty table; players will be added dynamically as they join.
+	t := game.NewTable("table-1")
+	e := game.NewEngine(t, 5, 10) // 5/10 blinds
+
+	// Create WS server with general API key + host-only start key
 	s := connection.NewServer(apiKey)
 	s.RegisterTable("table-1", t, e)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	mux := http.NewServeMux()
+	s.ServeHTTP(mux)
 
-	if err := connection.StartHTTPServer(ctx, s); err != nil {
-		log.Fatal(err)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
+
+	log.Printf("listening on :%s ...", port)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
