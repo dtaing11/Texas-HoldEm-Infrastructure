@@ -30,13 +30,14 @@ type Engine struct {
 	MinRaise   int // dynamic; resets each street to BB (or last raise size)
 	Pot        int
 
-	toActIdx          int            // index into Table.Players
-	roundBets         map[string]int // chips put in this betting round (street)
-	totalContrib      map[string]int // chips contributed this hand (for side pots)
-	highestThisStreet int            // amount to call on this street
-	lastAggressorIdx  int            // index into Players; used to detect round close
-	openAction        bool           // has anyone bet/raised this street
-	evaluator         Evaluator      // hand ranking
+	toActIdx          int             // index into Table.Players
+	roundBets         map[string]int  // chips put in this betting round (street)
+	totalContrib      map[string]int  // chips contributed this hand (for side pots)
+	actedThisStreet   map[string]bool // has this player taken an action on this street?
+	highestThisStreet int             // amount to call on this street
+	lastAggressorIdx  int             // index into Players; used to detect round close
+	openAction        bool            // has anyone bet/raised this street
+	evaluator         Evaluator       // hand ranking
 }
 
 // Evaluator offers a 7-card hand rank comparison. Higher is better.
@@ -51,13 +52,15 @@ type HandRank uint64
 
 func NewEngine(t *Table, sb, bb int) *Engine {
 	return &Engine{
-		Table:        t,
-		SmallBlind:   sb,
-		BigBlind:     bb,
-		MinRaise:     bb,
-		roundBets:    make(map[string]int),
-		totalContrib: make(map[string]int),
-		evaluator:    &SimpleEvaluator{}, // replace with a stronger one if desired
+		Table:           t,
+		SmallBlind:      sb,
+		BigBlind:        bb,
+		MinRaise:        bb, // min raise starts as big blind
+		toActIdx:        -1,
+		roundBets:       make(map[string]int),
+		totalContrib:    make(map[string]int),
+		actedThisStreet: make(map[string]bool),
+		evaluator:       &SimpleEvaluator{}, // replace with a stronger one if desired
 	}
 }
 
@@ -182,10 +185,15 @@ func (e *Engine) StartHand() error {
 	e.Pot = 0
 	e.roundBets = map[string]int{}
 	e.totalContrib = map[string]int{}
+	e.actedThisStreet = map[string]bool{}
 	e.highestThisStreet = 0
 	e.openAction = false
 	e.lastAggressorIdx = -1
 	e.MinRaise = e.BigBlind
+	e.toActIdx = -1
+
+	// set phase
+	e.Table.Phase = PREFLOP
 
 	// fresh deck
 	e.Table.CardStack = newDeck()
@@ -238,6 +246,7 @@ func (e *Engine) postBlind(idx int, amount int) {
 	if amount > e.highestThisStreet {
 		e.highestThisStreet = amount
 	}
+	// IMPORTANT: blinds do NOT count as "actedThisStreet" for closing logic
 }
 
 // ---------- Acting ----------
@@ -245,7 +254,7 @@ func (e *Engine) postBlind(idx int, amount int) {
 type ActRequest struct {
 	PlayerID string
 	Action   Action
-	Amount   int // for RAISE only: total bet increment over current to-call (i.e., raise size)
+	Amount   int // for RAISE only: raise size over current to-call
 }
 
 // Act applies a player's action. On street completion, advances phase automatically.
@@ -266,89 +275,110 @@ func (e *Engine) Act(req ActRequest) error {
 	}
 
 	toCall := e.highestThisStreet - e.roundBets[p.ID]
+
 	switch req.Action {
 	case FOLD:
 		p.playerState = FOLDED
-		// next player
-		e.toActIdx = e.findNextToActAfterFold(pi)
+		e.actedThisStreet[p.ID] = true
+
 	case CHECK:
 		if toCall != 0 {
 			return ErrInvalidAction
 		}
-		e.toActIdx = e.advanceOrClose(pi, false)
+		e.actedThisStreet[p.ID] = true
+
 	case CALL:
 		if toCall <= 0 {
 			// treat as check
-			e.toActIdx = e.advanceOrClose(pi, false)
-			break
+			e.actedThisStreet[p.ID] = true
+		} else {
+			callAmt := min(toCall, p.Chips)
+			p.Chips -= callAmt
+			e.roundBets[p.ID] += callAmt
+			e.totalContrib[p.ID] += callAmt
+			e.Pot += callAmt
+			if callAmt < toCall {
+				p.playerState = ALLIN
+			}
+			e.actedThisStreet[p.ID] = true
 		}
-		callAmt := min(toCall, p.Chips)
-		p.Chips -= callAmt
-		e.roundBets[p.ID] += callAmt
-		e.totalContrib[p.ID] += callAmt
-		e.Pot += callAmt
-		if callAmt < toCall {
-			p.playerState = ALLIN
-		}
-		e.toActIdx = e.advanceOrClose(pi, false)
+
 	case RAISE:
-		// No-limit raise: player must first call, then raise by >= MinRaise (unless all-in smaller, which is allowed but doesn't reset MinRaise)
+		// No-limit raise: player must first call, then raise by >= MinRaise
 		minRaise := e.MinRaise
 		raiseSize := req.Amount
 		if raiseSize < 0 {
 			return ErrInvalidAction
 		}
 		totalNeeded := toCall + raiseSize
+
 		if p.Chips < totalNeeded {
-			// allow all-in raise smaller than min; it will NOT reopen action
+			// all-in corner cases
 			if p.Chips <= toCall {
-				// it's effectively a CALL (all-in for call)
+				// all-in call
 				callAmt := p.Chips
 				p.Chips = 0
 				e.roundBets[p.ID] += callAmt
 				e.totalContrib[p.ID] += callAmt
 				e.Pot += callAmt
 				p.playerState = ALLIN
-				e.toActIdx = e.advanceOrClose(pi, false)
-				break
+				e.actedThisStreet[p.ID] = true
+			} else {
+				// short raise all-in; does not reset MinRaise or last aggressor
+				callAmt := toCall
+				extra := p.Chips - callAmt
+				p.Chips = 0
+				e.roundBets[p.ID] += callAmt + extra
+				e.totalContrib[p.ID] += callAmt + extra
+				e.Pot += callAmt + extra
+				if e.roundBets[p.ID] > e.highestThisStreet {
+					e.highestThisStreet = e.roundBets[p.ID]
+				}
+				p.playerState = ALLIN
+				e.actedThisStreet[p.ID] = true
 			}
-			// partial raise: allowed but does not reset MinRaise or last aggressor
-			callAmt := toCall
-			extra := p.Chips - callAmt
-			p.Chips = 0
-			e.roundBets[p.ID] += callAmt + extra
-			e.totalContrib[p.ID] += callAmt + extra
-			e.Pot += callAmt + extra
+		} else {
+			// proper raise
+			if raiseSize < minRaise {
+				return ErrRaiseTooSmall
+			}
+			commit := totalNeeded
+			p.Chips -= commit
+			e.roundBets[p.ID] += commit
+			e.totalContrib[p.ID] += commit
+			e.Pot += commit
 			if e.roundBets[p.ID] > e.highestThisStreet {
 				e.highestThisStreet = e.roundBets[p.ID]
 			}
-			p.playerState = ALLIN
-			e.toActIdx = e.advanceOrClose(pi, false)
-			break
-		}
-		// must be a legal raise
-		if raiseSize < minRaise {
-			return ErrRaiseTooSmall
+			e.MinRaise = raiseSize
+			e.openAction = true
+			e.lastAggressorIdx = pi
+			e.actedThisStreet[p.ID] = true
 		}
 
-		commit := totalNeeded
-		p.Chips -= commit
-		e.roundBets[p.ID] += commit
-		e.totalContrib[p.ID] += commit
-		e.Pot += commit
-		if e.roundBets[p.ID] > e.highestThisStreet {
-			e.highestThisStreet = e.roundBets[p.ID]
-		}
-
-		// successful raise resets MinRaise to raiseSize and sets last aggressor
-		e.MinRaise = raiseSize
-		e.openAction = true
-		e.lastAggressorIdx = pi
-
-		e.toActIdx = e.nextIdx(pi)
 	default:
 		return ErrInvalidAction
 	}
+
+	// Decide next to act
+	next := pi
+
+	if p.playerState == FOLDED {
+		next = e.findNextToActAfterFold(pi)
+	} else {
+		// INHAND or ALLIN → just move to the next seat
+		next = e.nextIdx(pi)
+	}
+
+	// As a safety net: if next == pi but we still have >1 contender, force move
+	if next == pi {
+		contenders := e.contenders()
+		if len(contenders) > 1 {
+			next = e.nextIdx(pi)
+		}
+	}
+
+	e.toActIdx = next
 
 	// If betting round naturally closes, advance street (and maybe showdown)
 	if e.bettingRoundComplete() {
@@ -379,7 +409,7 @@ func (e *Engine) contenders() []*Player {
 	return out
 }
 
-// advanceOrClose advances turn pointer or triggers close if we just matched last aggressor
+// advanceOrClose advances turn pointer or triggers close if we just matched last aggressor.
 func (e *Engine) advanceOrClose(prevIdx int, forceClose bool) int {
 	if forceClose {
 		return prevIdx
@@ -389,11 +419,12 @@ func (e *Engine) advanceOrClose(prevIdx int, forceClose bool) int {
 }
 
 // bettingRoundComplete checks if everyone has acted such that no more action is possible:
-//   - All remaining players are either folded or all-in, or
-//   - Every non-all-in player has matched the highest bet (checks/calls) and there's no pending action.
+//   - All remaining players are either folded or all-in, OR
+//   - Every non-all-in player has ACTED at least once this street, and all have matched highestThisStreet.
 func (e *Engine) bettingRoundComplete() bool {
 	alive := 0
 	allinOrFold := 0
+
 	for _, p := range e.Table.Players {
 		if p == nil {
 			continue
@@ -405,26 +436,25 @@ func (e *Engine) bettingRoundComplete() bool {
 		alive++
 		if p.playerState == ALLIN {
 			allinOrFold++
-			continue
 		}
 	}
+
 	// Everyone is folded or all-in ⇒ round ends
 	if alive == allinOrFold {
 		return true
 	}
-	// No open action and everyone matched (all checks)
-	if !e.openAction {
-		for _, p := range e.Table.Players {
-			if p == nil || p.playerState != INHAND {
-				continue
-			}
-			if e.roundBets[p.ID] != e.highestThisStreet {
-				return false
-			}
+
+	// Every INHAND player must have acted at least once
+	for _, p := range e.Table.Players {
+		if p == nil || p.playerState != INHAND {
+			continue
 		}
-		return true
+		if !e.actedThisStreet[p.ID] {
+			return false
+		}
 	}
-	// Open action exists: close when all non-all-in have matched
+
+	// And all non-all-in players must have matched the highest bet
 	for _, p := range e.Table.Players {
 		if p == nil || p.playerState != INHAND {
 			continue
@@ -433,6 +463,7 @@ func (e *Engine) bettingRoundComplete() bool {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -440,9 +471,10 @@ func (e *Engine) bettingRoundComplete() bool {
 
 func (e *Engine) resetStreet() {
 	e.roundBets = map[string]int{}
+	e.actedThisStreet = map[string]bool{}
 	e.highestThisStreet = 0
 	e.openAction = false
-	e.MinRaise = e.BigBlind
+	e.MinRaise = e.BigBlind // reset min raise to big blind each street
 	e.lastAggressorIdx = -1
 }
 
@@ -462,6 +494,7 @@ func (e *Engine) advanceStreet() error {
 		e.resetStreet()
 		// first to act: left of dealer
 		e.toActIdx = e.leftOf(e.DealerBtn)
+
 	case FLOP:
 		// turn: burn, deal 1
 		e.burn()
@@ -469,6 +502,7 @@ func (e *Engine) advanceStreet() error {
 		e.Table.Phase = TURN
 		e.resetStreet()
 		e.toActIdx = e.leftOf(e.DealerBtn)
+
 	case TURN:
 		// river: burn, deal 1
 		e.burn()
@@ -476,13 +510,16 @@ func (e *Engine) advanceStreet() error {
 		e.Table.Phase = RIVER
 		e.resetStreet()
 		e.toActIdx = e.leftOf(e.DealerBtn)
+
 	case RIVER:
 		// showdown
 		e.Table.Phase = SHOWDOWN
 		e.showdown()
 		e.endHand()
+
 	case SHOWDOWN, WAITING:
 		// nothing
+
 	default:
 		return fmt.Errorf("unknown phase: %s", e.Table.Phase)
 	}
@@ -885,8 +922,8 @@ func (e *Engine) String() string {
 		if p == nil {
 			continue
 		}
-		fmt.Fprintf(&b, "Seat %d: %s chips=%d state=%s betThisStreet=%d contrib=%d cards=%v\n",
-			i, p.ID, p.Chips, p.playerState, e.roundBets[p.ID], e.totalContrib[p.ID], p.Cards)
+		fmt.Fprintf(&b, "Seat %d: %s chips=%d state=%s betThisStreet=%d contrib=%d cards=%v acted=%v\n",
+			i, p.ID, p.Chips, p.playerState, e.roundBets[p.ID], e.totalContrib[p.ID], p.Cards, e.actedThisStreet[p.ID])
 	}
 	return b.String()
 }

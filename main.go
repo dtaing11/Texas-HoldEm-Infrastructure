@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -11,24 +10,25 @@ import (
 )
 
 func main() {
-	// General auth key for all WS clients
+	// General API key
 	apiKey := os.Getenv("API_KEY")
 	if apiKey == "" {
-		apiKey = "dev" // local testing
+		apiKey = "dev"
 	}
 
-	// Special key that is allowed to start a game (host key)
+	// Host-only start key ("god key")
 	startKey := os.Getenv("START_KEY")
 	if startKey == "" {
-		startKey = "host-dev" // local testing
+		startKey = "supersecret"
 	}
 
-	// One empty table; players will be added dynamically as they join.
+	// Create table + engine
 	t := game.NewTable("table-1")
-	e := game.NewEngine(t, 5, 10) // 5/10 blinds
+	e := game.NewEngine(t, 5, 10)
 
-	// Create WS server with general API key + host-only start key
-	s := connection.NewServer(apiKey)
+	// NEW: pass BOTH keys to NewServer
+	s := connection.NewServer(apiKey, startKey)
+
 	s.RegisterTable("table-1", t, e)
 
 	mux := http.NewServeMux()

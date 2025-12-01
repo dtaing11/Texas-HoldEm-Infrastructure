@@ -1,518 +1,446 @@
-// internal/connection/server.go
+// connection/server.go
 package connection
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"strconv"
-	"strings"
 	"sync"
-	"time"
-
-	"github.com/gorilla/websocket"
 
 	"github.com/dtaing11/Texas-HoldEm-Infrastructure/game"
+	"github.com/gorilla/websocket"
 )
 
-var (
-	ErrUnauthorized = errors.New("unauthorized")
-)
-
-// starting chip stack for new players
-const (
-	defaultChips = 1000
-)
-
-// ------------ Public Server ------------
-
-// Server holds global config and all table hubs.
+// Server manages tables and WebSocket connections.
 type Server struct {
-	apiKey       string
-	hostStartKey string // secret that allows a client to become "host"
+	apiKey   string
+	startKey string
 
-	// tableID -> hub
-	hubsMu sync.RWMutex
-	hubs   map[string]*hub
-
-	upgrader websocket.Upgrader
-
-	// optional: logger
-	log *log.Logger
+	mu     sync.Mutex
+	tables map[string]*tableBinding
 }
 
-// NewServer constructs a WebSocket server. apiKey is required for auth.
-// Host start key is read from env START_KEY (default: "supersecret").
-func NewServer(apiKey string) *Server {
-	startKey := os.Getenv("START_KEY")
-	if strings.TrimSpace(startKey) == "" {
-		startKey = "supersecret"
-	}
+// tableBinding ties a game.Table + Engine to connected clients.
+type tableBinding struct {
+	Table  *game.Table
+	Engine *game.Engine
 
-	s := &Server{
-		apiKey:       apiKey,
-		hostStartKey: startKey,
-		hubs:         make(map[string]*hub),
-		upgrader: websocket.Upgrader{
-			ReadBufferSize:  4096,
-			WriteBufferSize: 4096,
-			// You can lock this down further with an origin check if needed.
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
-		log: log.New(os.Stdout, "[ws] ", log.LstdFlags|log.Lmicroseconds),
-	}
-	return s
+	mu          sync.Mutex
+	clients     map[*Client]struct{}
+	host        *Client
+	handCounter int
 }
 
-// RegisterTable wires a game.Table + Engine into a WebSocket hub under the given tableID.
-// Call this once per table during process init (or dynamically when creating tables).
-func (s *Server) RegisterTable(tableID string, t *game.Table, e *game.Engine) {
-	s.hubsMu.Lock()
-	defer s.hubsMu.Unlock()
-	if _, ok := s.hubs[tableID]; ok {
-		return
-	}
-	h := newHub(tableID, t, e, s.log)
-	s.hubs[tableID] = h
-	go h.run()
+// Client is a single WebSocket connection (either host or player).
+type Client struct {
+	conn     *websocket.Conn
+	server   *Server
+	binding  *tableBinding
+	playerID string
+	isHost   bool
+	send     chan []byte
 }
 
-// ServeHTTP attaches routes for WS & health. Mount this on your mux.
+// Messages coming from clients.
+type inboundMessage struct {
+	Type   string      `json:"type"`             // "join", "act", "host_start", "host_act"
+	Player string      `json:"player,omitempty"` // for host_act: target player ID
+	Action game.Action `json:"action,omitempty"` // CHECK/CALL/RAISE/FOLD/RAISE
+	Amount int         `json:"amount,omitempty"` // for RAISE
+}
+
+// Messages going to clients.
+type StatePayload struct {
+	Type  string       `json:"type"` // "state"
+	State *PublicState `json:"state"`
+}
+
+// PublicState is per-client filtered view.
+type PublicState struct {
+	Table    *game.Table `json:"table"`
+	Pot      int         `json:"pot"`
+	Phase    game.Phase  `json:"phase"`
+	Board    []game.Card `json:"board"`
+	ToActIdx int         `json:"toActIdx"`
+	Hand     int         `json:"hand"`
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+// NewServer takes a general API key (for all WS clients)
+// and a special startKey that only the host knows.
+func NewServer(apiKey, startKey string) *Server {
+	return &Server{
+		apiKey:   apiKey,
+		startKey: startKey,
+		tables:   make(map[string]*tableBinding),
+	}
+}
+
+// RegisterTable wires a table + engine into this server under a given ID.
+func (s *Server) RegisterTable(id string, t *game.Table, e *game.Engine) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.tables[id] = &tableBinding{
+		Table:   t,
+		Engine:  e,
+		clients: make(map[*Client]struct{}),
+	}
+}
+
+// ServeHTTP registers the /ws endpoint on the provided mux.
 func (s *Server) ServeHTTP(mux *http.ServeMux) {
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
 	mux.HandleFunc("/ws", s.handleWS)
 }
 
-// ------------ Auth helpers ------------
-
-func (s *Server) authorize(r *http.Request) (tableID string, err error) {
-	// Accept credentials via query OR headers
-	q := r.URL.Query()
-	apiKey := firstNonEmpty(
-		q.Get("apiKey"),
-		r.Header.Get("X-API-Key"),
-	)
-	tableID = firstNonEmpty(
-		q.Get("table"),
-		r.Header.Get("X-Table-ID"),
-	)
-
-	if apiKey == "" || tableID == "" || apiKey != s.apiKey {
-		return "", ErrUnauthorized
-	}
-	return tableID, nil
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-// ------------ WS Handler ------------
-
+// handleWS upgrades to WebSocket, authenticates, and creates a Client.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	tableID, err := s.authorize(r)
-	if err != nil {
+	q := r.URL.Query()
+	apiKey := q.Get("apiKey")
+	if apiKey != s.apiKey {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	s.hubsMu.RLock()
-	h, ok := s.hubs[tableID]
-	s.hubsMu.RUnlock()
+	tableID := q.Get("table")
+	playerID := q.Get("player")
+	if tableID == "" || playerID == "" {
+		http.Error(w, "missing table or player", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	binding, ok := s.tables[tableID]
+	s.mu.Unlock()
 	if !ok {
-		http.Error(w, "table not found", http.StatusNotFound)
+		http.Error(w, "unknown table", http.StatusNotFound)
 		return
 	}
 
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		s.log.Printf("upgrade error: %v", err)
-		return
-	}
-
-	// Identify player from query/header (required).
-	playerID := firstNonEmpty(
-		r.URL.Query().Get("player"),
-		r.Header.Get("X-Player-ID"),
-	)
-	if playerID == "" {
-		_ = conn.WriteControl(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "missing player id"),
-			time.Now().Add(2*time.Second))
-		_ = conn.Close()
-		return
-	}
-
-	// Host detection: needs correct startKey.
+	// Determine if this client is the host (god mode) by startKey.
 	isHost := false
-	startKey := firstNonEmpty(
-		r.URL.Query().Get("startKey"),
-		r.Header.Get("X-Start-Key"),
-	)
-	if startKey != "" && startKey == s.hostStartKey {
+	if sk := q.Get("startKey"); sk != "" && sk == s.startKey {
 		isHost = true
 	}
 
-	client := &client{
-		playerID: playerID,
-		h:        h,
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[ws] upgrade error: %v", err)
+		return
+	}
+
+	client := &Client{
 		conn:     conn,
-		send:     make(chan []byte, 64),
-		log:      s.log,
+		server:   s,
+		binding:  binding,
+		playerID: playerID,
 		isHost:   isHost,
+		send:     make(chan []byte, 32),
 	}
 
-	// register & spawn pumps
-	h.register <- client
-	go client.writePump()
-	go client.readPump()
-}
-
-// =====================================================
-// ================ Hub & Client =======================
-// =====================================================
-
-type hub struct {
-	tableID string
-	table   *game.Table
-	engine  *game.Engine
-
-	// live clients
-	mu      sync.RWMutex
-	clients map[*client]struct{}
-
-	// channels
-	register   chan *client
-	unregister chan *client
-	broadcast  chan []byte
-
-	log *log.Logger
-}
-
-func newHub(tableID string, t *game.Table, e *game.Engine, logger *log.Logger) *hub {
-	return &hub{
-		tableID:    tableID,
-		table:      t,
-		engine:     e,
-		clients:    make(map[*client]struct{}),
-		register:   make(chan *client),
-		unregister: make(chan *client),
-		broadcast:  make(chan []byte, 128),
-		log:        logger,
+	// Register client with the table.
+	binding.mu.Lock()
+	binding.clients[client] = struct{}{}
+	if isHost {
+		log.Printf("[ws] host connected: table=%s hostID=%s", tableID, playerID)
+		binding.host = client
+	} else {
+		// Seat only real players, never host.
+		ensurePlayerSeated(binding.Table, playerID)
+		log.Printf("[ws] player joined: table=%s player=%s", tableID, playerID)
 	}
-}
 
-func (h *hub) run() {
-	ticker := time.NewTicker(25 * time.Second) // ping cadence safety
-	defer ticker.Stop()
+	// Decide whether we should auto-start a hand now
+	shouldStart := binding.canStartHandLocked()
+	binding.mu.Unlock()
 
-	for {
-		select {
-		case c := <-h.register:
-			h.mu.Lock()
-			h.clients[c] = struct{}{}
-			// Ensure this player exists with chips on the table.
-			h.ensurePlayer(c.playerID)
-			h.mu.Unlock()
-
-			h.log.Printf("client join: table=%s player=%s host=%v", h.tableID, c.playerID, c.isHost)
-			h.pushStateTo(c)
-
-		case c := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[c]; ok {
-				delete(h.clients, c)
-				close(c.send)
-			}
-			h.mu.Unlock()
-			h.log.Printf("client leave: table=%s player=%s", h.tableID, c.playerID)
-
-		case msg := <-h.broadcast:
-			h.mu.Lock()
-			for c := range h.clients {
-				select {
-				case c.send <- msg:
-				default:
-					// slow consumer: drop connection
-					close(c.send)
-					delete(h.clients, c)
-				}
-			}
-			h.mu.Unlock()
-
-		case <-ticker.C:
-			// periodic state push (optional); can be removed if purely event-driven
-			h.pushState()
+	// If host is present and we have at least 2 players and phase=WAITING,
+	// auto-start the hand immediately.
+	if shouldStart {
+		log.Printf("[HOST_LOGIC] Auto-starting hand #%d (on connect)", binding.handCounter)
+		if err := binding.Engine.StartHand(); err != nil {
+			log.Printf("[HOST_LOGIC] StartHand error: %v", err)
 		}
 	}
+
+	// Send initial state snapshot (after any auto-start).
+	binding.mu.Lock()
+	binding.broadcastStateLocked()
+	binding.mu.Unlock()
+
+	go client.writeLoop()
+	go client.readLoop()
 }
 
-// ensurePlayer seats a player on the table if they don't already exist.
-func (h *hub) ensurePlayer(playerID string) *game.Player {
-	for _, p := range h.table.Players {
-		if p != nil && p.ID == playerID {
+// ensurePlayerSeated adds a player with default chips if not already present.
+func ensurePlayerSeated(t *game.Table, id string) *game.Player {
+	for _, p := range t.Players {
+		if p != nil && p.ID == id {
 			return p
 		}
 	}
 	p := &game.Player{
-		ID:    playerID,
-		Chips: defaultChips,
+		ID:    id,
+		Chips: 1000,
 	}
-	h.table.AddPlayer(p)
-	h.log.Printf("new player seated: table=%s player=%s chips=%d",
-		h.tableID, playerID, p.Chips)
+	t.AddPlayer(p)
 	return p
 }
 
-func (h *hub) pushState() {
-	payload := serverMessage{
-		Type: "state",
-		State: &statePayload{
-			Table:    h.table,
-			Pot:      h.engine.Pot,
-			Phase:    string(h.table.Phase),
-			Board:    h.table.CardOpen,
-			ToActIdx: h.peekToActIdx(),
-		},
+// canStartHandLocked returns true if:
+// - host is connected
+// - table is in WAITING phase
+// - at least 2 seated players have chips
+// NOTE: must be called with tb.mu held.
+func (tb *tableBinding) canStartHandLocked() bool {
+	if tb.host == nil {
+		return false
 	}
-	h.broadcastJSON(payload)
-}
-
-func (h *hub) pushStateTo(c *client) {
-	payload := serverMessage{
-		Type: "state",
-		State: &statePayload{
-			Table:    h.table,
-			Pot:      h.engine.Pot,
-			Phase:    string(h.table.Phase),
-			Board:    h.table.CardOpen,
-			ToActIdx: h.peekToActIdx(),
-		},
+	if tb.Table == nil || tb.Engine == nil {
+		return false
 	}
-	c.sendJSON(payload)
-}
-
-// peekToActIdx asks the engine whose turn it is.
-// Requires game.Engine.ToActIndex() int to be implemented.
-func (h *hub) peekToActIdx() int {
-	if h.engine == nil {
-		return -1
+	if tb.Table.Phase != game.WAITING {
+		return false
 	}
-	return h.engine.ToActIndex()
-}
-
-func (h *hub) broadcastJSON(v any) {
-	b, _ := json.Marshal(v)
-	h.broadcast <- b
-}
-
-func (h *hub) handleClientMessage(c *client, in clientMessage) {
-	switch in.Type {
-	case "join":
-
-		// No-op: presence is already established. Could re-send state.
-		h.pushStateTo(c)
-
-	case "start_hand":
-		// Only host can start a hand
-		if !c.isHost {
-			c.sendJSON(serverMessage{Type: "error", Error: "only host can start hand"})
-			return
+	// count players with chips
+	count := 0
+	for _, p := range tb.Table.Players {
+		if p != nil && p.Chips > 0 {
+			count++
 		}
-
-		if err := h.engine.StartHand(); err != nil {
-			c.sendJSON(serverMessage{Type: "error", Error: err.Error()})
-			return
-		}
-		h.pushState()
-
-	case "act":
-		// validate fields
-		if in.PlayerID == "" || in.Action == "" {
-			c.sendJSON(serverMessage{Type: "error", Error: "missing playerId or action"})
-			return
-		}
-		a := strings.ToUpper(in.Action)
-		var act game.Action
-		switch a {
-		case "FOLD":
-			act = game.FOLD
-		case "CHECK":
-			act = game.CHECK
-		case "CALL":
-			act = game.CALL
-		case "RAISE":
-			act = game.RAISE
-		default:
-			c.sendJSON(serverMessage{Type: "error", Error: "invalid action"})
-			return
-		}
-		amt := 0
-		if in.Amount != nil {
-			amt = *in.Amount
-		}
-		err := h.engine.Act(game.ActRequest{
-			PlayerID: in.PlayerID,
-			Action:   act,
-			Amount:   amt, // raise size (not final total)
-		})
-		if err != nil {
-			c.sendJSON(serverMessage{Type: "error", Error: err.Error()})
-			return
-		}
-		h.pushState()
-
-	default:
-		c.sendJSON(serverMessage{Type: "error", Error: "unknown message type"})
 	}
+	return count >= 2
 }
 
-// ------------ Client ------------
+// buildPublicStateFor returns a per-client filtered state:
+// - Host: sees everything (all cards).
+// - Player: sees only their own hole cards; others masked.
+func (tb *tableBinding) buildPublicStateFor(c *Client) *PublicState {
+	// Shallow copy table.
+	tableCopy := *tb.Table
 
-type client struct {
-	playerID string
-	isHost   bool
-	h        *hub
-	conn     *websocket.Conn
-	send     chan []byte
-	log      *log.Logger
-}
-
-func (c *client) readPump() {
-	defer func() {
-		c.h.unregister <- c
-		_ = c.conn.Close()
-	}()
-
-	_ = c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	c.conn.SetPongHandler(func(string) error {
-		_ = c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
-
-	for {
-		_, message, err := c.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				return
-			}
-			c.log.Printf("read error: %v", err)
-			return
-		}
-
-		var msg clientMessage
-		if err := json.Unmarshal(message, &msg); err != nil {
-			c.sendJSON(serverMessage{Type: "error", Error: "bad json"})
+	// Deep-ish copy players slice so we can mask cards safely.
+	playersCopy := make([]*game.Player, len(tb.Table.Players))
+	for i, p := range tb.Table.Players {
+		if p == nil {
 			continue
 		}
-		c.h.handleClientMessage(c, msg)
+		cp := *p
+		// Mask hole cards for other players if this client is not host.
+		if !c.isHost && cp.ID != c.playerID {
+			cp.Cards = [2]game.Card{}
+		}
+		playersCopy[i] = &cp
+	}
+	tableCopy.Players = playersCopy
+
+	return &PublicState{
+		Table:    &tableCopy,
+		Pot:      tb.Engine.Pot,
+		Phase:    tb.Table.Phase,
+		Board:    tb.Table.CardOpen,
+		ToActIdx: tb.Engine.ToActIndex(),
+		Hand:     tb.handCounter,
 	}
 }
 
-func (c *client) writePump() {
-	ticker := time.NewTicker(20 * time.Second)
-	defer func() {
-		ticker.Stop()
-		_ = c.conn.Close()
-	}()
-
-	for {
+// broadcastStateLocked assumes tb.mu is already held.
+func (tb *tableBinding) broadcastStateLocked() {
+	for c := range tb.clients {
+		state := tb.buildPublicStateFor(c)
+		payload := StatePayload{
+			Type:  "state",
+			State: state,
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("[ws] marshal state error: %v", err)
+			continue
+		}
 		select {
-		case msg, ok := <-c.send:
-			_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if !ok {
-				// hub closed the channel
-				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-				return
-			}
-		case <-ticker.C:
-			_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
+		case c.send <- data:
+		default:
+			// Drop if writer is stuck.
 		}
 	}
 }
 
-func (c *client) sendJSON(v any) {
-	b, _ := json.Marshal(v)
-	select {
-	case c.send <- b:
-	default:
-		// drop if buffer full
+// broadcastState is a safe helper when you DON'T already hold tb.mu.
+func (tb *tableBinding) broadcastState() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.broadcastStateLocked()
+}
+
+// readLoop processes JSON messages from this client.
+func (c *Client) readLoop() {
+	defer c.close()
+
+	for {
+		var msg inboundMessage
+		if err := c.conn.ReadJSON(&msg); err != nil {
+			log.Printf("[ws] read error (player=%s): %v", c.playerID, err)
+			return
+		}
+
+		switch msg.Type {
+		case "join":
+			// Already handled at connect time.
+
+		case "act":
+			// Normal player acting for themselves.
+			if c.isHost {
+				// host should not send `act`
+				continue
+			}
+			c.handlePlayerAct(msg)
+
+		case "host_start":
+			// You won't really need this anymore, but keep it safe:
+			if !c.isHost {
+				log.Printf("[ws] non-host tried host_start (player=%s)", c.playerID)
+				continue
+			}
+			c.handleHostStart()
+
+		case "host_act":
+			// Host can still force actions if you ever want scripted play.
+			if !c.isHost {
+				log.Printf("[ws] non-host tried host_act (player=%s)", c.playerID)
+				continue
+			}
+			c.handleHostAct(msg)
+
+		default:
+			log.Printf("[ws] unknown message type: %s", msg.Type)
+		}
 	}
 }
 
-// =====================================================
-// ================= Message Schema ====================
-// =====================================================
+// writeLoop sends messages from c.send to the WebSocket.
+func (c *Client) writeLoop() {
+	defer c.close()
 
-type clientMessage struct {
-	Type     string `json:"type"` // "join" | "start_hand" | "act"
-	PlayerID string `json:"playerId,omitempty"`
-	Action   string `json:"action,omitempty"` // "FOLD"|"CHECK"|"CALL"|"RAISE"
-	Amount   *int   `json:"amount,omitempty"` // raise size
+	for {
+		data, ok := <-c.send
+		if !ok {
+			return
+		}
+		if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			log.Printf("[ws] write error: %v", err)
+			return
+		}
+	}
 }
 
-type serverMessage struct {
-	Type  string        `json:"type"`            // "state" | "error"
-	Error string        `json:"error,omitempty"` //
-	State *statePayload `json:"state,omitempty"`
-}
-
-type statePayload struct {
-	Table    *game.Table `json:"table"`
-	Pot      int         `json:"pot"`
-	Phase    string      `json:"phase"`
-	Board    []game.Card `json:"board"`
-	ToActIdx int         `json:"toActIdx"` // -1 if hidden
-}
-
-// =====================================================
-// ================ Bootstrapping ======================
-// =====================================================
-
-// Convenience helper to start an HTTP server that Cloud Run can use.
-// (Not used in your simple main.go, but useful for Cloud Run.)
-func StartHTTPServer(ctx context.Context, s *Server) error {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	if _, err := strconv.Atoi(port); err != nil {
-		return fmt.Errorf("invalid PORT: %v", err)
-	}
-
-	mux := http.NewServeMux()
-	s.ServeHTTP(mux)
-
-	// Basic server
-	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           mux,
-		ReadHeaderTimeout: 15 * time.Second,
-	}
-
-	go func() {
-		<-ctx.Done()
-		_ = srv.Shutdown(context.Background())
+// close unregisters the client and closes its connection.
+func (c *Client) close() {
+	// Make close idempotent by recovering panics from double-close on send.
+	defer func() {
+		recover()
 	}()
 
-	log.Printf("listening on :%s ...", port)
-	return srv.ListenAndServe()
+	c.binding.mu.Lock()
+	if _, ok := c.binding.clients[c]; ok {
+		delete(c.binding.clients, c)
+	}
+	if c.binding.host == c {
+		log.Printf("[ws] host disconnected: player=%s", c.playerID)
+		c.binding.host = nil
+	}
+	c.binding.mu.Unlock()
+
+	_ = c.conn.Close()
+	close(c.send)
+}
+
+// handlePlayerAct handles a normal player's action (acting for themselves).
+func (c *Client) handlePlayerAct(msg inboundMessage) {
+	tb := c.binding
+
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	log.Printf("[ws] handlePlayerAct: player=%s action=%v amount=%d",
+		c.playerID, msg.Action, msg.Amount)
+
+	prevPhase := tb.Table.Phase
+
+	err := tb.Engine.Act(game.ActRequest{
+		PlayerID: c.playerID,
+		Action:   msg.Action,
+		Amount:   msg.Amount,
+	})
+	if err != nil {
+		log.Printf("[ws] player act error: table=%s player=%s err=%v",
+			tb.Table.ID, c.playerID, err)
+		return
+	}
+
+	// Detect hand end (transition to WAITING).
+	if prevPhase != game.WAITING && tb.Table.Phase == game.WAITING {
+		log.Printf("[HOST_LOGIC] Hand #%d finished.", tb.handCounter)
+		tb.handCounter++
+	}
+
+	tb.broadcastStateLocked()
+}
+
+// handleHostStart lets the host start a new hand (kept for safety/manual use).
+func (c *Client) handleHostStart() {
+	tb := c.binding
+
+	tb.mu.Lock()
+	canStart := tb.canStartHandLocked()
+	if !canStart {
+		tb.mu.Unlock()
+		log.Printf("[HOST_LOGIC] host_start ignored: either no host, not WAITING, or <2 players")
+		return
+	}
+
+	log.Printf("[HOST_LOGIC] Starting hand #%d (host_start)", tb.handCounter)
+	if err := tb.Engine.StartHand(); err != nil {
+		tb.mu.Unlock()
+		log.Printf("[HOST_LOGIC] StartHand error: %v", err)
+		return
+	}
+
+	tb.broadcastStateLocked()
+	tb.mu.Unlock()
+}
+
+// handleHostAct lets the host force an action for a specific player.
+func (c *Client) handleHostAct(msg inboundMessage) {
+	tb := c.binding
+
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	if msg.Player == "" {
+		log.Printf("[HOST_LOGIC] host_act missing target player")
+		return
+	}
+
+	prevPhase := tb.Table.Phase
+
+	err := tb.Engine.Act(game.ActRequest{
+		PlayerID: msg.Player,
+		Action:   msg.Action,
+		Amount:   msg.Amount,
+	})
+	if err != nil {
+		log.Printf("[HOST_LOGIC] host_act error: target=%s err=%v", msg.Player, err)
+		return
+	}
+
+	// Detect hand end.
+	if prevPhase != game.WAITING && tb.Table.Phase == game.WAITING {
+		log.Printf("[HOST_LOGIC] Hand #%d finished.", tb.handCounter)
+		tb.handCounter++
+	}
+
+	tb.broadcastStateLocked()
 }
