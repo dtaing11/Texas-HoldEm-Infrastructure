@@ -1,10 +1,11 @@
-// internal/gameloop/engine.go
+// game/engine.go
 package game
 
 import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"sort"
 	"strings"
@@ -227,6 +228,9 @@ func (e *Engine) StartHand() error {
 	// first to act: left of BB
 	e.toActIdx = e.leftOf(bbIdx)
 
+	log.Printf("[ENGINE] StartHand: dealer=%d sb=%d bb=%d toAct=%d",
+		e.DealerBtn, sbIdx, bbIdx, e.toActIdx)
+
 	return nil
 }
 
@@ -246,7 +250,7 @@ func (e *Engine) postBlind(idx int, amount int) {
 	if amount > e.highestThisStreet {
 		e.highestThisStreet = amount
 	}
-	// IMPORTANT: blinds do NOT count as "actedThisStreet" for closing logic
+	// blinds do NOT count as "actedThisStreet" for closing logic
 }
 
 // ---------- Acting ----------
@@ -275,6 +279,9 @@ func (e *Engine) Act(req ActRequest) error {
 	}
 
 	toCall := e.highestThisStreet - e.roundBets[p.ID]
+
+	log.Printf("[ENGINE] Act: player=%s action=%v amount=%d toCall=%d phase=%s",
+		p.ID, req.Action, req.Amount, toCall, e.Table.Phase)
 
 	switch req.Action {
 	case FOLD:
@@ -360,43 +367,22 @@ func (e *Engine) Act(req ActRequest) error {
 		return ErrInvalidAction
 	}
 
-	// Decide next to act
-	next := pi
-
-	if p.playerState == FOLDED {
-		next = e.findNextToActAfterFold(pi)
-	} else {
-		// INHAND or ALLIN → just move to the next seat
-		next = e.nextIdx(pi)
-	}
-
-	// As a safety net: if next == pi but we still have >1 contender, force move
-	if next == pi {
-		contenders := e.contenders()
-		if len(contenders) > 1 {
-			next = e.nextIdx(pi)
-		}
-	}
-
-	e.toActIdx = next
-
-	// If betting round naturally closes, advance street (and maybe showdown)
-	if e.bettingRoundComplete() {
-		if err := e.advanceStreet(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// determine next to act after a fold: if only one left, end immediately
-func (e *Engine) findNextToActAfterFold(pi int) int {
+	// If only one contender remains, award pot immediately.
 	if len(e.contenders()) == 1 {
-		// award pot immediately
 		e.awardWhenOnlyOne()
-		return pi
+		return nil
 	}
-	return e.advanceOrClose(pi, false)
+
+	// If betting round naturally closes, advance street (and maybe showdown).
+	if e.bettingRoundComplete() {
+		return e.advanceStreet()
+	}
+
+	// Otherwise, move to next player.
+	e.toActIdx = e.nextIdx(pi)
+
+	log.Printf("[ENGINE] after act by %s:\n%s", p.ID, e.String())
+	return nil
 }
 
 func (e *Engine) contenders() []*Player {
@@ -407,15 +393,6 @@ func (e *Engine) contenders() []*Player {
 		}
 	}
 	return out
-}
-
-// advanceOrClose advances turn pointer or triggers close if we just matched last aggressor.
-func (e *Engine) advanceOrClose(prevIdx int, forceClose bool) int {
-	if forceClose {
-		return prevIdx
-	}
-	nxt := e.nextIdx(prevIdx)
-	return nxt
 }
 
 // bettingRoundComplete checks if everyone has acted such that no more action is possible:
@@ -440,7 +417,7 @@ func (e *Engine) bettingRoundComplete() bool {
 	}
 
 	// Everyone is folded or all-in ⇒ round ends
-	if alive == allinOrFold {
+	if alive > 0 && alive == allinOrFold {
 		return true
 	}
 
@@ -516,6 +493,7 @@ func (e *Engine) advanceStreet() error {
 		e.Table.Phase = SHOWDOWN
 		e.showdown()
 		e.endHand()
+		e.toActIdx = -1
 
 	case SHOWDOWN, WAITING:
 		// nothing
@@ -530,11 +508,13 @@ func (e *Engine) awardWhenOnlyOne() {
 	for _, p := range e.Table.Players {
 		if p != nil && p.playerState != FOLDED {
 			p.Chips += e.Pot
+			log.Printf("[SHOWDOWN] Only one contender (%s), awarding pot=%d", p.ID, e.Pot)
 			e.Pot = 0
 			break
 		}
 	}
 	e.endHand()
+	e.toActIdx = -1
 }
 
 func (e *Engine) endHand() {
@@ -639,8 +619,20 @@ func (e *Engine) showdown() {
 				winners = append(winners, idx)
 			}
 		}
+
+		// Compute split
 		share := L.amount / len(winners)
 		rem := L.amount % len(winners)
+
+		// Log winners for this pot layer
+		winnerIDs := []string{}
+		for _, idx := range winners {
+			winnerIDs = append(winnerIDs, e.Table.Players[idx].ID)
+		}
+		log.Printf("[SHOWDOWN] PotLayer cap=%d amount=%d winners=%v share=%d rem=%d",
+			L.capAmount, L.amount, winnerIDs, share, rem)
+
+		// Apply chips
 		for i, idx := range winners {
 			e.Table.Players[idx].Chips += share
 			if i < rem {
@@ -653,6 +645,17 @@ func (e *Engine) showdown() {
 	if e.Pot < 0 {
 		e.Pot = 0
 	}
+
+	// Final stacks log
+	var b strings.Builder
+	b.WriteString("[SHOWDOWN] Final stacks: ")
+	for _, p := range e.Table.Players {
+		if p == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "%s:%d ", p.ID, p.Chips)
+	}
+	log.Print(b.String())
 }
 
 // ---------- Query helpers ----------
@@ -684,7 +687,7 @@ const (
 
 var rankVal = map[string]int{
 	"2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
-	"10": 10, "J": 11, "Q": 12, "K": 13, "A": 14,
+	"T": 10, "J": 11, "Q": 12, "K": 13, "A": 14,
 }
 
 func (s *SimpleEvaluator) Rank7(hole [2]Card, board []Card) HandRank {

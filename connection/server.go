@@ -45,7 +45,7 @@ type Client struct {
 type inboundMessage struct {
 	Type   string      `json:"type"`             // "join", "act", "host_start", "host_act"
 	Player string      `json:"player,omitempty"` // for host_act: target player ID
-	Action game.Action `json:"action,omitempty"` // CHECK/CALL/RAISE/FOLD/RAISE
+	Action game.Action `json:"action,omitempty"` // CHECK/CALL/RAISE/FOLD
 	Amount int         `json:"amount,omitempty"` // for RAISE
 }
 
@@ -155,19 +155,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	// Decide whether we should auto-start a hand now
 	shouldStart := binding.canStartHandLocked()
-	binding.mu.Unlock()
-
-	// If host is present and we have at least 2 players and phase=WAITING,
-	// auto-start the hand immediately.
 	if shouldStart {
 		log.Printf("[HOST_LOGIC] Auto-starting hand #%d (on connect)", binding.handCounter)
 		if err := binding.Engine.StartHand(); err != nil {
 			log.Printf("[HOST_LOGIC] StartHand error: %v", err)
 		}
 	}
-
-	// Send initial state snapshot (after any auto-start).
-	binding.mu.Lock()
+	// Broadcast state while we still hold the lock.
 	binding.broadcastStateLocked()
 	binding.mu.Unlock()
 
@@ -263,7 +257,6 @@ func (tb *tableBinding) broadcastStateLocked() {
 		select {
 		case c.send <- data:
 		default:
-			// Drop if writer is stuck.
 		}
 	}
 }
@@ -299,7 +292,7 @@ func (c *Client) readLoop() {
 			c.handlePlayerAct(msg)
 
 		case "host_start":
-			// You won't really need this anymore, but keep it safe:
+			// kept for manual use
 			if !c.isHost {
 				log.Printf("[ws] non-host tried host_start (player=%s)", c.playerID)
 				continue
@@ -307,7 +300,7 @@ func (c *Client) readLoop() {
 			c.handleHostStart()
 
 		case "host_act":
-			// Host can still force actions if you ever want scripted play.
+			// Host can force actions if desired.
 			if !c.isHost {
 				log.Printf("[ws] non-host tried host_act (player=%s)", c.playerID)
 				continue
@@ -384,6 +377,14 @@ func (c *Client) handlePlayerAct(msg inboundMessage) {
 	if prevPhase != game.WAITING && tb.Table.Phase == game.WAITING {
 		log.Printf("[HOST_LOGIC] Hand #%d finished.", tb.handCounter)
 		tb.handCounter++
+
+		// Auto-start next hand if possible.
+		if tb.canStartHandLocked() {
+			log.Printf("[HOST_LOGIC] Auto-starting hand #%d (post-hand)", tb.handCounter)
+			if err := tb.Engine.StartHand(); err != nil {
+				log.Printf("[HOST_LOGIC] StartHand error (post-hand): %v", err)
+			}
+		}
 	}
 
 	tb.broadcastStateLocked()
@@ -394,22 +395,21 @@ func (c *Client) handleHostStart() {
 	tb := c.binding
 
 	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
 	canStart := tb.canStartHandLocked()
 	if !canStart {
-		tb.mu.Unlock()
 		log.Printf("[HOST_LOGIC] host_start ignored: either no host, not WAITING, or <2 players")
 		return
 	}
 
 	log.Printf("[HOST_LOGIC] Starting hand #%d (host_start)", tb.handCounter)
 	if err := tb.Engine.StartHand(); err != nil {
-		tb.mu.Unlock()
 		log.Printf("[HOST_LOGIC] StartHand error: %v", err)
 		return
 	}
 
 	tb.broadcastStateLocked()
-	tb.mu.Unlock()
 }
 
 // handleHostAct lets the host force an action for a specific player.
@@ -440,6 +440,14 @@ func (c *Client) handleHostAct(msg inboundMessage) {
 	if prevPhase != game.WAITING && tb.Table.Phase == game.WAITING {
 		log.Printf("[HOST_LOGIC] Hand #%d finished.", tb.handCounter)
 		tb.handCounter++
+
+		// Auto-start next hand if possible.
+		if tb.canStartHandLocked() {
+			log.Printf("[HOST_LOGIC] Auto-starting hand #%d (post-hand)", tb.handCounter)
+			if err := tb.Engine.StartHand(); err != nil {
+				log.Printf("[HOST_LOGIC] StartHand error (post-hand): %v", err)
+			}
+		}
 	}
 
 	tb.broadcastStateLocked()
