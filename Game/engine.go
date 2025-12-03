@@ -151,6 +151,26 @@ func (e *Engine) stillContesting() []*Player {
 func (e *Engine) leftOf(idx int) int { return e.nextIdx(idx) }
 
 // ---------- Hand lifecycle ----------
+// resetPerHandPlayerState clears per-hand info so that players who folded
+// or went all-in in the previous hand are eligible again if they still
+// have chips.
+func (e *Engine) resetPerHandPlayerState() {
+	for _, p := range e.Table.Players {
+		if p == nil {
+			continue
+		}
+		// Clear old hole cards
+		p.Cards = [2]Card{}
+
+		if p.Chips > 0 {
+			// Seated and has chips -> can play this hand
+			p.playerState = INHAND
+		} else {
+			// Busted player stays effectively out of action
+			p.playerState = FOLDED
+		}
+	}
+}
 
 func (e *Engine) ToActIndex() int {
 	if e.Table == nil {
@@ -183,6 +203,10 @@ func (e *Engine) StartHand() error {
 
 	// reset table/engine
 	e.Table.ResetHand()
+
+	// 🔧 IMPORTANT: reset per-player state for this new hand
+	e.resetPerHandPlayerState()
+
 	e.Pot = 0
 	e.roundBets = map[string]int{}
 	e.totalContrib = map[string]int{}
@@ -202,7 +226,6 @@ func (e *Engine) StartHand() error {
 
 	// deal two cards to each player in seat order, starting left of dealer
 	start := e.leftOf(e.DealerBtn)
-	// two passes
 	for pass := 0; pass < 2; pass++ {
 		i := start
 		for loop := 0; loop < len(e.Table.Players); loop++ {
@@ -213,7 +236,7 @@ func (e *Engine) StartHand() error {
 					panic("deck underflow")
 				}
 				p.Cards[pass] = card[0]
-				p.playerState = INHAND
+				// p.playerState is already INHAND from resetPerHandPlayerState()
 			}
 			i = e.leftOf(i)
 		}
@@ -227,9 +250,6 @@ func (e *Engine) StartHand() error {
 
 	// first to act: left of BB
 	e.toActIdx = e.leftOf(bbIdx)
-
-	log.Printf("[ENGINE] StartHand: dealer=%d sb=%d bb=%d toAct=%d",
-		e.DealerBtn, sbIdx, bbIdx, e.toActIdx)
 
 	return nil
 }
