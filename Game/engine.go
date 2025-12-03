@@ -57,6 +57,7 @@ func NewEngine(t *Table, sb, bb int) *Engine {
 		SmallBlind:      sb,
 		BigBlind:        bb,
 		MinRaise:        bb, // min raise starts as big blind
+		DealerBtn:       -1, // sentinel: no dealer yet
 		toActIdx:        -1,
 		roundBets:       make(map[string]int),
 		totalContrib:    make(map[string]int),
@@ -107,19 +108,57 @@ func (e *Engine) burn() { _ = e.draw(1) }
 
 // ---------- Seating helpers ----------
 
+// nextIdx is for ACTION TURN ORDER within a hand.
+// Only players currently INHAND (not folded, not all-in) will get a turn.
 func (e *Engine) nextIdx(i int) int {
 	n := len(e.Table.Players)
+	if n == 0 {
+		return -1
+	}
 	for step := 1; step <= n; step++ {
 		j := (i + step) % n
 		p := e.Table.Players[j]
 		if p == nil {
 			continue
 		}
-		if p.playerState != FOLDED && p.Chips >= 0 {
+		if p.playerState == INHAND && p.Chips > 0 {
 			return j
 		}
 	}
 	return i
+}
+
+// For dealer/button rotation we only care that the seat has a player with chips,
+// regardless of last-hand INHAND/FOLDED/ALLIN state.
+func (e *Engine) seatHasChips(idx int) bool {
+	if idx < 0 || idx >= len(e.Table.Players) {
+		return false
+	}
+	p := e.Table.Players[idx]
+	return p != nil && p.Chips > 0
+}
+
+func (e *Engine) firstSeatWithChips() int {
+	for i := range e.Table.Players {
+		if e.seatHasChips(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (e *Engine) nextSeatWithChips(from int) int {
+	n := len(e.Table.Players)
+	if n == 0 {
+		return -1
+	}
+	for step := 1; step <= n; step++ {
+		j := (from + step) % n
+		if e.seatHasChips(j) {
+			return j
+		}
+	}
+	return from
 }
 
 func (e *Engine) activeAndUnfolded() []*Player {
@@ -151,9 +190,10 @@ func (e *Engine) stillContesting() []*Player {
 func (e *Engine) leftOf(idx int) int { return e.nextIdx(idx) }
 
 // ---------- Hand lifecycle ----------
+
 // resetPerHandPlayerState clears per-hand info so that players who folded
 // or went all-in in the previous hand are eligible again if they still
-// have chips.
+// have chips. Busted players (chips == 0) are kept FOLDED.
 func (e *Engine) resetPerHandPlayerState() {
 	for _, p := range e.Table.Players {
 		if p == nil {
@@ -163,10 +203,8 @@ func (e *Engine) resetPerHandPlayerState() {
 		p.Cards = [2]Card{}
 
 		if p.Chips > 0 {
-			// Seated and has chips -> can play this hand
 			p.playerState = INHAND
 		} else {
-			// Busted player stays effectively out of action
 			p.playerState = FOLDED
 		}
 	}
@@ -194,19 +232,22 @@ func (e *Engine) StartHand() error {
 		return ErrNoActivePlayers
 	}
 
-	// rotate dealer button
-	if e.DealerBtn < 0 || e.DealerBtn >= len(e.Table.Players) {
-		e.DealerBtn = 0
-	} else {
-		e.DealerBtn = e.leftOf(e.DealerBtn)
-	}
-
-	// reset table/engine
+	// Reset board/hand-wide table state
 	e.Table.ResetHand()
 
 	// 🔧 IMPORTANT: reset per-player state for this new hand
+	// so that players who folded or went all-in last hand
+	// can play again if they still have chips.
 	e.resetPerHandPlayerState()
 
+	// Rotate dealer button among seats that have chips.
+	if e.DealerBtn < 0 || e.DealerBtn >= len(e.Table.Players) || !e.seatHasChips(e.DealerBtn) {
+		e.DealerBtn = e.firstSeatWithChips()
+	} else {
+		e.DealerBtn = e.nextSeatWithChips(e.DealerBtn)
+	}
+
+	// reset engine fields
 	e.Pot = 0
 	e.roundBets = map[string]int{}
 	e.totalContrib = map[string]int{}
@@ -225,31 +266,35 @@ func (e *Engine) StartHand() error {
 	shuffle(e.Table.CardStack)
 
 	// deal two cards to each player in seat order, starting left of dealer
-	start := e.leftOf(e.DealerBtn)
+	start := e.nextSeatWithChips(e.DealerBtn)
 	for pass := 0; pass < 2; pass++ {
 		i := start
 		for loop := 0; loop < len(e.Table.Players); loop++ {
-			p := e.Table.Players[i]
-			if p != nil && p.Chips > 0 {
-				card := e.draw(1)
-				if card == nil {
-					panic("deck underflow")
-				}
-				p.Cards[pass] = card[0]
-				// p.playerState is already INHAND from resetPerHandPlayerState()
+			if !e.seatHasChips(i) {
+				i = (i + 1) % len(e.Table.Players)
+				continue
 			}
-			i = e.leftOf(i)
+			p := e.Table.Players[i]
+			card := e.draw(1)
+			if card == nil {
+				panic("deck underflow")
+			}
+			p.Cards[pass] = card[0]
+			i = (i + 1) % len(e.Table.Players)
 		}
 	}
 
 	// blinds
-	sbIdx := e.leftOf(e.DealerBtn)
-	bbIdx := e.leftOf(sbIdx)
+	sbIdx := e.nextSeatWithChips(e.DealerBtn)
+	bbIdx := e.nextSeatWithChips(sbIdx)
 	e.postBlind(sbIdx, e.SmallBlind)
 	e.postBlind(bbIdx, e.BigBlind)
 
-	// first to act: left of BB
-	e.toActIdx = e.leftOf(bbIdx)
+	// first to act: left of BB (in action sense)
+	e.toActIdx = e.nextIdx(bbIdx)
+
+	log.Printf("[ENGINE] StartHand: dealer=%d sb=%d bb=%d toAct=%d",
+		e.DealerBtn, sbIdx, bbIdx, e.toActIdx)
 
 	return nil
 }
@@ -264,7 +309,7 @@ func (e *Engine) postBlind(idx int, amount int) {
 	e.roundBets[p.ID] += put
 	e.totalContrib[p.ID] += put
 	e.Pot += put
-	if put < amount {
+	if put < amount || p.Chips == 0 {
 		p.playerState = ALLIN
 	}
 	if amount > e.highestThisStreet {
@@ -324,7 +369,7 @@ func (e *Engine) Act(req ActRequest) error {
 			e.roundBets[p.ID] += callAmt
 			e.totalContrib[p.ID] += callAmt
 			e.Pot += callAmt
-			if callAmt < toCall {
+			if p.Chips == 0 {
 				p.playerState = ALLIN
 			}
 			e.actedThisStreet[p.ID] = true
@@ -490,7 +535,7 @@ func (e *Engine) advanceStreet() error {
 		e.Table.Phase = FLOP
 		e.resetStreet()
 		// first to act: left of dealer
-		e.toActIdx = e.leftOf(e.DealerBtn)
+		e.toActIdx = e.nextIdx(e.DealerBtn)
 
 	case FLOP:
 		// turn: burn, deal 1
@@ -498,7 +543,7 @@ func (e *Engine) advanceStreet() error {
 		e.Table.CardOpen = append(e.Table.CardOpen, e.draw(1)...)
 		e.Table.Phase = TURN
 		e.resetStreet()
-		e.toActIdx = e.leftOf(e.DealerBtn)
+		e.toActIdx = e.nextIdx(e.DealerBtn)
 
 	case TURN:
 		// river: burn, deal 1
@@ -506,7 +551,7 @@ func (e *Engine) advanceStreet() error {
 		e.Table.CardOpen = append(e.Table.CardOpen, e.draw(1)...)
 		e.Table.Phase = RIVER
 		e.resetStreet()
-		e.toActIdx = e.leftOf(e.DealerBtn)
+		e.toActIdx = e.nextIdx(e.DealerBtn)
 
 	case RIVER:
 		// showdown
