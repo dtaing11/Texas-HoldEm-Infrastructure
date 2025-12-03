@@ -11,8 +11,8 @@ from typing import Optional, Tuple, Any, Dict
 
 load_dotenv()
 BASEURL = os.getenv("BASEURL")
-API_KEY = os.getenv("API_KEY")
-TABLE_ID = os.getenv("TABLE_ID")
+API_KEY = os.getenv("APIKEY")
+TABLE_ID = os.getenv("TABLEID")
 
 if not BASEURL:
     raise RuntimeError("BASEURL environment variable is not set")
