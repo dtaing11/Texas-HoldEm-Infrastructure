@@ -94,13 +94,59 @@ func shuffle(deck []Card) {
 	}
 }
 
-// CanPlayerAct returns true if this player is the one to act and is not
-// already folded or all-in, and the hand is actually running.
+// ---------- Turn / acting helpers ----------
+
+// normalizeToActIdx ensures toActIdx either points to a player who can act
+// (INHAND with chips) or is set to -1 if nobody can act.
+func (e *Engine) normalizeToActIdx() {
+	if e.Table == nil {
+		e.toActIdx = -1
+		return
+	}
+
+	// No one can act when the hand isn't running.
+	if e.Table.Phase == WAITING || e.Table.Phase == SHOWDOWN {
+		e.toActIdx = -1
+		return
+	}
+
+	// See if there is anyone who can actually act.
+	hasActable := false
+	for _, p := range e.Table.Players {
+		if p != nil && p.playerState == INHAND && p.Chips > 0 {
+			hasActable = true
+			break
+		}
+	}
+	if !hasActable {
+		// Everyone is either all-in or folded ⇒ no one to act.
+		e.toActIdx = -1
+		return
+	}
+
+	// If toActIdx is out of range, pick the first actable player left of dealer.
+	if e.toActIdx < 0 || e.toActIdx >= len(e.Table.Players) {
+		e.toActIdx = e.nextIdx(e.DealerBtn)
+		return
+	}
+
+	// If current toActIdx points at someone who cannot act, move to the next.
+	p := e.Table.Players[e.toActIdx]
+	if p == nil || p.playerState != INHAND || p.Chips <= 0 {
+		e.toActIdx = e.nextIdx(e.toActIdx)
+	}
+}
+
+// CanPlayerAct returns true if this player is the one to act and the hand is active.
+// It also normalizes toActIdx so it never points at an ALLIN/FOLDED/busted seat.
 func (e *Engine) CanPlayerAct(playerID string) bool {
 	if e.Table == nil {
 		return false
 	}
-	// hand must be running
+
+	// Keep toActIdx sane before checking.
+	e.normalizeToActIdx()
+
 	if e.Table.Phase == WAITING || e.Table.Phase == SHOWDOWN {
 		return false
 	}
@@ -111,22 +157,61 @@ func (e *Engine) CanPlayerAct(playerID string) bool {
 		return false
 	}
 
-	// must be the one to act
-	if idx != e.toActIdx {
+	// If normalizeToActIdx found no actable players, toActIdx will be -1.
+	if e.toActIdx < 0 || e.toActIdx >= len(e.Table.Players) {
 		return false
 	}
 
-	p := e.Table.Players[idx]
-	if p == nil {
-		return false
+	// From the server's POV, the only rule we enforce is "is it your turn?"
+	// The engine's Act() still handles folds/all-ins/etc.
+	return idx == e.toActIdx
+}
+
+// ResetGame puts the engine/table into a clean state:
+//
+// - All seated players get `startingChips`
+// - Pot and betting state cleared
+// - Phase set to WAITING
+// - Board cleared
+// - Dealer button reset so the next hand can re-pick a dealer
+func (e *Engine) ResetGame(startingChips int) {
+	if e.Table == nil {
+		return
 	}
 
-	// cannot act if already folded or all-in
-	if p.playerState == FOLDED || p.playerState == ALLIN {
-		return false
+	log.Printf("[ENGINE] ResetGame: startingChips=%d", startingChips)
+
+	// Clear per-hand table state
+	e.Table.ResetHand()
+	e.Table.Phase = WAITING
+	e.Table.CardOpen = nil
+	e.Table.CardStack = nil
+
+	// Reset engine-wide bookkeeping
+	e.Pot = 0
+	e.roundBets = make(map[string]int)
+	e.totalContrib = make(map[string]int)
+	e.actedThisStreet = make(map[string]bool)
+	e.highestThisStreet = 0
+	e.openAction = false
+	e.lastAggressorIdx = -1
+	e.toActIdx = -1
+	e.MinRaise = e.BigBlind
+	e.DealerBtn = -1 // force StartHand to pick a fresh dealer
+
+	// Reset each player's chips; keep seats but put everyone
+	// back to the starting stack.
+	for _, p := range e.Table.Players {
+		if p == nil {
+			continue
+		}
+		p.Chips = startingChips
 	}
 
-	return true
+	// Re-init per-hand player state (cards + INHAND/FOLDED) based on chips
+	e.resetPerHandPlayerState()
+
+	log.Printf("[ENGINE] ResetGame done: phase=%s pot=%d", e.Table.Phase, e.Pot)
 }
 
 // pops top n cards from CardStack (top = end of slice)
@@ -278,6 +363,9 @@ func (e *Engine) ToActIndex() int {
 	if e.Table == nil {
 		return -1
 	}
+
+	e.normalizeToActIdx()
+
 	if e.toActIdx < 0 || e.toActIdx >= len(e.Table.Players) {
 		return -1
 	}
@@ -389,23 +477,40 @@ type ActRequest struct {
 }
 
 // Act applies a player's action. On street completion, advances phase automatically.
+// If a player makes an illegal move (wrong turn, bad check, too-small raise, etc.),
+// they are treated as FOLDED instead of returning an error (except for truly
+// fatal conditions like hand not running / no such player).
 func (e *Engine) Act(req ActRequest) error {
 	if e.Table.Phase == WAITING {
 		return ErrHandNotRunning
 	}
+
 	pi := e.findPlayerIdx(req.PlayerID)
 	if pi < 0 {
 		return ErrNoSuchPlayer
 	}
-	if pi != e.toActIdx {
-		return ErrNotPlayersTurn
-	}
 	p := e.Table.Players[pi]
+	if p == nil {
+		return ErrNoSuchPlayer
+	}
+
+	// Already out of the hand: nothing to do.
 	if p.playerState == FOLDED || p.playerState == ALLIN {
-		return ErrAlreadyActed
+		log.Printf("[ENGINE] Act: player=%s already %s; ignoring action %v",
+			p.ID, p.playerState, req.Action)
+		return nil
 	}
 
 	toCall := e.highestThisStreet - e.roundBets[p.ID]
+
+	// Wrong player trying to act? Treat as fold.
+	if pi != e.toActIdx {
+		log.Printf("[ENGINE] illegal off-turn action by %s (action=%v), treating as FOLD",
+			p.ID, req.Action)
+		p.playerState = FOLDED
+		e.actedThisStreet[p.ID] = true
+		return e.postAction(pi, p)
+	}
 
 	log.Printf("[ENGINE] Act: player=%s action=%v amount=%d toCall=%d phase=%s",
 		p.ID, req.Action, req.Amount, toCall, e.Table.Phase)
@@ -417,13 +522,18 @@ func (e *Engine) Act(req ActRequest) error {
 
 	case CHECK:
 		if toCall != 0 {
-			return ErrInvalidAction
+			// Illegal check when facing a bet → fold.
+			log.Printf("[ENGINE] illegal CHECK by %s with toCall=%d; treating as FOLD",
+				p.ID, toCall)
+			p.playerState = FOLDED
+			e.actedThisStreet[p.ID] = true
+		} else {
+			e.actedThisStreet[p.ID] = true
 		}
-		e.actedThisStreet[p.ID] = true
 
 	case CALL:
 		if toCall <= 0 {
-			// treat as check
+			// Nothing to call; treat as check.
 			e.actedThisStreet[p.ID] = true
 		} else {
 			callAmt := min(toCall, p.Chips)
@@ -438,16 +548,21 @@ func (e *Engine) Act(req ActRequest) error {
 		}
 
 	case RAISE:
-		// No-limit raise: player must first call, then raise by >= MinRaise
 		minRaise := e.MinRaise
 		raiseSize := req.Amount
+
 		if raiseSize < 0 {
-			return ErrInvalidAction
+			// Negative raise size is nonsense → fold.
+			log.Printf("[ENGINE] illegal negative RAISE by %s; treating as FOLD", p.ID)
+			p.playerState = FOLDED
+			e.actedThisStreet[p.ID] = true
+			return e.postAction(pi, p)
 		}
+
 		totalNeeded := toCall + raiseSize
 
 		if p.Chips < totalNeeded {
-			// all-in corner cases
+			// all-in corner cases (these are still legal)
 			if p.Chips <= toCall {
 				// all-in call
 				callAmt := p.Chips
@@ -472,9 +587,14 @@ func (e *Engine) Act(req ActRequest) error {
 				e.actedThisStreet[p.ID] = true
 			}
 		} else {
-			// proper raise
+			// proper raise path
 			if raiseSize < minRaise {
-				return ErrRaiseTooSmall
+				// Too-small raise ⇒ illegal → fold.
+				log.Printf("[ENGINE] illegal small RAISE by %s (size=%d < minRaise=%d); folding",
+					p.ID, raiseSize, minRaise)
+				p.playerState = FOLDED
+				e.actedThisStreet[p.ID] = true
+				return e.postAction(pi, p)
 			}
 			commit := totalNeeded
 			p.Chips -= commit
@@ -491,9 +611,18 @@ func (e *Engine) Act(req ActRequest) error {
 		}
 
 	default:
-		return ErrInvalidAction
+		// Unknown action string → treat as fold.
+		log.Printf("[ENGINE] unknown action %v by %s; treating as FOLD", req.Action, p.ID)
+		p.playerState = FOLDED
+		e.actedThisStreet[p.ID] = true
 	}
 
+	return e.postAction(pi, p)
+}
+
+// postAction runs common post-action logic: check for single contender,
+// check whether betting round is complete, otherwise advance to next player.
+func (e *Engine) postAction(pi int, p *Player) error {
 	// If only one contender remains, award pot immediately.
 	if len(e.contenders()) == 1 {
 		e.awardWhenOnlyOne()
@@ -629,7 +758,7 @@ func (e *Engine) advanceStreet() error {
 		return fmt.Errorf("unknown phase: %s", e.Table.Phase)
 	}
 
-	// 🔥 Auto-run remaining streets if everyone is all-in or folded.
+	// Auto-run remaining streets if everyone is all-in or folded.
 	// Once we hit SHOWDOWN/WAITING this won't recurse further.
 	if e.Table.Phase != SHOWDOWN && e.Table.Phase != WAITING && e.everyoneAllInOrFolded() {
 		log.Printf("[ENGINE] All players all-in/folded; auto-advancing from phase=%s", e.Table.Phase)

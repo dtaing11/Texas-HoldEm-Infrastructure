@@ -13,15 +13,15 @@ import matplotlib.pyplot as plt
 # If you're using .env, uncomment:
 ##load_dotenv()
 
-# WS_URL_TEMPLATE = (
-#     "wss://texasholdem-871757115753.northamerica-northeast1.run.app"
-#     "/ws?apiKey={apiKey}&table={table}&player={player}&startKey={startKey}"
-# )
-
 WS_URL_TEMPLATE = (
-    "ws://localhost:8080/ws"
-    "?apiKey={apiKey}&table={table}&player={player}&startKey={startKey}"
+    "wss://texasholdem-871757115753.northamerica-northeast1.run.app"
+    "/ws?apiKey={apiKey}&table={table}&player={player}&startKey={startKey}"
 )
+
+# WS_URL_TEMPLATE = (
+#     "ws://localhost:8080/ws"
+#     "?apiKey={apiKey}&table={table}&player={player}&startKey={startKey}"
+# )
 
 api_key = "dev"
 table_id = "table-1"
@@ -53,8 +53,7 @@ def update_chip_history(players, hand_no, phase):
     """
     Record each player's chip stack once per hand.
 
-    x-axis: hand_no
-    y-axis: chips
+    We still store history, but for the bar chart we mainly use latest chips.
     """
     global last_logged_hand
 
@@ -180,7 +179,7 @@ def main():
     manager = getattr(manager, "manager", None)
     if manager is not None:
         try:
-            manager.set_window_title("Chip Stacks vs Hand Number")
+            manager.set_window_title("Chip Stacks – Live Bar Chart")
         except Exception:
             pass
 
@@ -229,30 +228,43 @@ def main():
                         print("[HOST] send failed:", e)
                         stop_event.set()
                         break
-
                 else:
                     print("[HOST] unknown command. Use:")
                     print("  s")
                     print("  r")
                     print("  q")
 
-            # 2) Update plot
+            # 2) Update plot – BAR GRAPH of current chips
             with history_lock:
                 ax.clear()
-                if chip_history:
-                    for pid, series in chip_history.items():
-                        hands = series["hands"]
-                        chips = series["chips"]
-                        if not hands:
-                            continue
-                        ax.plot(hands, chips, marker="o", label=pid)
 
-                    ax.set_xlabel("Hand #")
+                # Only keep active players (last chips > 0)
+                active = {}
+                for pid, series in chip_history.items():
+                    chips = series["chips"]
+                    if chips and chips[-1] > 0:
+                        active[pid] = chips[-1]  # keep only latest chip value
+
+                if active:
+                    names = list(active.keys())
+                    values = [active[pid] for pid in names]
+                    x_positions = range(len(names))
+
+                    ax.bar(x_positions, values)
+                    ax.set_xticks(list(x_positions))
+                    ax.set_xticklabels(names, rotation=45, ha="right")
+
+                    ax.set_xlabel("Player")
                     ax.set_ylabel("Chips")
-                    ax.set_title("Chip stacks over hands")
-                    ax.legend()
+                    ax.set_title("Current chip stacks (active players)")
+
+                    # Zoom y-axis around current values
+                    ymin = 0
+                    ymax = max(values)
+                    padding = max(10, int(0.1 * ymax)) if ymax > 0 else 10
+                    ax.set_ylim(ymin, ymax + padding)
                 else:
-                    ax.set_title("Waiting for hands…")
+                    ax.set_title("Waiting for active players…")
 
             fig.canvas.draw()
             fig.canvas.flush_events()

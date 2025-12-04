@@ -43,8 +43,8 @@ type Client struct {
 
 // Messages coming from clients.
 type inboundMessage struct {
-	Type   string      `json:"type"`             // "join", "act", "host_start", "host_act"
-	Player string      `json:"player,omitempty"` // for host_act: target player ID
+	Type   string      `json:"type"`             // "join", "act", "host_start", "host_reset"
+	Player string      `json:"player,omitempty"` // (unused now)
 	Action game.Action `json:"action,omitempty"` // CHECK/CALL/RAISE/FOLD
 	Amount int         `json:"amount,omitempty"` // for RAISE
 }
@@ -53,12 +53,6 @@ type inboundMessage struct {
 type StatePayload struct {
 	Type  string       `json:"type"` // "state"
 	State *PublicState `json:"state"`
-}
-
-// ErrorPayload is used to tell a client their action was invalid and they must retry.
-type ErrorPayload struct {
-	Type  string `json:"type"`  // "retry"
-	Error string `json:"error"` // human-readable error from engine
 }
 
 // PublicState is per-client filtered view.
@@ -307,13 +301,13 @@ func (c *Client) readLoop() {
 			}
 			c.handleHostStart()
 
-		case "host_act":
-			// Host can force actions if desired.
+		case "host_reset":
+			// host can reset the whole game
 			if !c.isHost {
-				log.Printf("[ws] non-host tried host_act (player=%s)", c.playerID)
+				log.Printf("[ws] non-host tried host_reset (player=%s)", c.playerID)
 				continue
 			}
-			c.handleHostAct(msg)
+			c.handleHostReset()
 
 		default:
 			log.Printf("[ws] unknown message type: %s", msg.Type)
@@ -368,9 +362,9 @@ func (c *Client) handlePlayerAct(msg inboundMessage) {
 	log.Printf("[ws] handlePlayerAct: player=%s action=%v amount=%d",
 		c.playerID, msg.Action, msg.Amount)
 
-	// 🔒 SERVER-SIDE GATE:
-	// If the engine says this player cannot act (already folded/all-in,
-	// not their turn, hand not running, etc.), ignore the request.
+	// SERVER-SIDE GATE:
+	// If the engine says this player cannot act (not their turn, etc.),
+	// ignore the request and just broadcast the current state.
 	if !tb.Engine.CanPlayerAct(c.playerID) {
 		log.Printf("[ws] ignoring act from %s: CanPlayerAct=false (phase=%s, toActIdx=%d)",
 			c.playerID, tb.Table.Phase, tb.Engine.ToActIndex())
@@ -386,8 +380,8 @@ func (c *Client) handlePlayerAct(msg inboundMessage) {
 		Amount:   msg.Amount,
 	})
 	if err != nil {
-		// This should now mostly catch truly bad requests (e.g. illegal raise size),
-		// not "already folded" / "not your turn".
+		// With "illegal ⇒ fold" semantics, this should mostly be fatal stuff
+		// like ErrHandNotRunning / ErrNoSuchPlayer.
 		log.Printf("[ws] player act error: table=%s player=%s err=%v",
 			tb.Table.ID, c.playerID, err)
 		tb.broadcastStateLocked()
@@ -433,57 +427,34 @@ func (c *Client) handleHostStart() {
 	tb.broadcastStateLocked()
 }
 
-// handleHostAct lets the host force an action for a specific player.
-func (c *Client) handleHostAct(msg inboundMessage) {
+// handleHostReset lets the host reset the table:
+// - All players back to 1000 chips
+// - handCounter reset to 0
+// - phase -> WAITING
+// - then immediately start a fresh hand if possible
+func (c *Client) handleHostReset() {
 	tb := c.binding
 
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	if msg.Player == "" {
-		log.Printf("[HOST_LOGIC] host_act missing target player")
-		return
-	}
+	log.Printf("[HOST_LOGIC] host_reset requested by host=%s", c.playerID)
 
-	prevPhase := tb.Table.Phase
+	// Reset our logical hand counter
+	tb.handCounter = 0
 
-	err := tb.Engine.Act(game.ActRequest{
-		PlayerID: msg.Player,
-		Action:   msg.Action,
-		Amount:   msg.Amount,
-	})
-	if err != nil {
-		log.Printf("[HOST_LOGIC] host_act error: target=%s err=%v", msg.Player, err)
+	// Reset engine + table stacks/state
+	tb.Engine.ResetGame(1000)
 
-		// 🔥 Send a retry message back to the host so UI can show error.
-		payload := ErrorPayload{
-			Type:  "retry",
-			Error: err.Error(),
-		}
-		if data, mErr := json.Marshal(payload); mErr != nil {
-			log.Printf("[ws] marshal retry error (host): %v", mErr)
-		} else {
-			select {
-			case c.send <- data:
-			default:
-			}
-		}
-		return
-	}
-
-	// Detect hand end.
-	if prevPhase != game.WAITING && tb.Table.Phase == game.WAITING {
-		log.Printf("[HOST_LOGIC] Hand #%d finished.", tb.handCounter)
-		tb.handCounter++
-
-		// Auto-start next hand if possible.
-		if tb.canStartHandLocked() {
-			log.Printf("[HOST_LOGIC] Auto-starting hand #%d (post-hand)", tb.handCounter)
-			if err := tb.Engine.StartHand(); err != nil {
-				log.Printf("[HOST_LOGIC] StartHand error (post-hand): %v", err)
-			}
+	// Try to immediately start a new hand if conditions allow:
+	// host present, phase=WAITING, at least 2 players with chips.
+	if tb.canStartHandLocked() {
+		log.Printf("[HOST_LOGIC] host_reset: starting fresh hand #%d", tb.handCounter)
+		if err := tb.Engine.StartHand(); err != nil {
+			log.Printf("[HOST_LOGIC] StartHand error after reset: %v", err)
 		}
 	}
 
+	// Broadcast fresh state to everyone
 	tb.broadcastStateLocked()
 }
