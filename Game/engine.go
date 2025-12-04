@@ -144,9 +144,10 @@ func (e *Engine) CanPlayerAct(playerID string) bool {
 		return false
 	}
 
-	// Keep toActIdx sane before checking.
+	// normalize any stale toActIdx
 	e.normalizeToActIdx()
 
+	// hand must be running
 	if e.Table.Phase == WAITING || e.Table.Phase == SHOWDOWN {
 		return false
 	}
@@ -186,6 +187,53 @@ func (e *Engine) ResetGame(startingChips int) {
 	e.Table.Phase = WAITING
 	e.Table.CardOpen = nil
 	e.Table.CardStack = nil
+
+	// Reset engine-wide bookkeeping
+	e.Pot = 0
+	e.roundBets = make(map[string]int)
+	e.totalContrib = make(map[string]int)
+	e.actedThisStreet = make(map[string]bool)
+	e.highestThisStreet = 0
+	e.openAction = false
+	e.lastAggressorIdx = -1
+	e.toActIdx = -1
+	e.MinRaise = e.BigBlind
+	e.DealerBtn = -1 // force StartHand to pick a fresh dealer
+
+	// Reset each player's chips; keep seats but put everyone
+	// back to the starting stack.
+	for _, p := range e.Table.Players {
+		if p == nil {
+			continue
+		}
+		p.Chips = startingChips
+	}
+
+	// Re-init per-hand player state (cards + INHAND/FOLDED) based on chips
+	e.resetPerHandPlayerState()
+
+	log.Printf("[ENGINE] ResetGame done: phase=%s pot=%d", e.Table.Phase, e.Pot)
+}
+
+// ResetGame puts the engine/table into a clean state:
+//
+// - All seated players get `startingChips`
+// - Pot and betting state cleared
+// - Phase set to WAITING
+// - Board cleared
+// - Dealer button reset so the next hand can re-pick a dealer
+func (e *Engine) ResetGame(startingChips int) {
+	if e.Table == nil {
+		return
+	}
+
+	log.Printf("[ENGINE] ResetGame: startingChips=%d", startingChips)
+
+	// Clear per-hand table state
+	e.Table.ResetHand()     // your existing helper
+	e.Table.Phase = WAITING // back to "no active hand"
+	e.Table.CardOpen = nil  // clear board
+	e.Table.CardStack = nil // fresh deck next hand
 
 	// Reset engine-wide bookkeeping
 	e.Pot = 0
@@ -310,32 +358,47 @@ func (e *Engine) stillContesting() []*Player {
 
 func (e *Engine) leftOf(idx int) int { return e.nextIdx(idx) }
 
-// everyoneAllInOrFolded returns true if all remaining contestants are either
-// ALLIN or FOLDED (no INHAND player with chips left to act).
+// normalizeToActIdx ensures toActIdx is either -1 or a seat that can still act.
+func (e *Engine) normalizeToActIdx() {
+	if e.Table == nil {
+		e.toActIdx = -1
+		return
+	}
+	n := len(e.Table.Players)
+	if e.toActIdx < 0 || e.toActIdx >= n {
+		e.toActIdx = -1
+		return
+	}
+	p := e.Table.Players[e.toActIdx]
+	if p == nil || p.playerState != INHAND || p.Chips <= 0 {
+		next := e.nextIdx(e.toActIdx)
+		if next == e.toActIdx {
+			e.toActIdx = -1
+		} else {
+			e.toActIdx = next
+		}
+	}
+}
+
+// everyoneAllInOrFolded returns true iff there are no INHAND players left:
+// every non-nil, non-folded player is ALLIN.
 func (e *Engine) everyoneAllInOrFolded() bool {
-	alive := 0
-	allinOrFold := 0
+	nonFold := 0
+	allIn := 0
 
 	for _, p := range e.Table.Players {
 		if p == nil {
 			continue
 		}
-
 		if p.playerState == FOLDED {
-			allinOrFold++
 			continue
 		}
-
-		// still in the hand
-		if p.playerState == INHAND || p.playerState == ALLIN {
-			alive++
-			if p.playerState == ALLIN {
-				allinOrFold++
-			}
+		nonFold++
+		if p.playerState == ALLIN {
+			allIn++
 		}
 	}
-
-	return alive > 0 && alive == allinOrFold
+	return nonFold > 0 && nonFold == allIn
 }
 
 // ---------- Hand lifecycle ----------
@@ -484,7 +547,6 @@ func (e *Engine) Act(req ActRequest) error {
 	if e.Table.Phase == WAITING {
 		return ErrHandNotRunning
 	}
-
 	pi := e.findPlayerIdx(req.PlayerID)
 	if pi < 0 {
 		return ErrNoSuchPlayer
@@ -652,32 +714,16 @@ func (e *Engine) contenders() []*Player {
 }
 
 // bettingRoundComplete checks if everyone has acted such that no more action is possible:
-//   - All remaining players are either folded or all-in, OR
-//   - Every non-all-in player has ACTED at least once this street, and all have matched highestThisStreet.
+//   - No INHAND players left (everyone is ALLIN or FOLDED), OR
+//   - Every INHAND player has ACTED at least once this street, and all have matched highestThisStreet.
 func (e *Engine) bettingRoundComplete() bool {
-	alive := 0
-	allinOrFold := 0
-
-	for _, p := range e.Table.Players {
-		if p == nil {
-			continue
-		}
-		if p.playerState == FOLDED {
-			allinOrFold++
-			continue
-		}
-		alive++
-		if p.playerState == ALLIN {
-			allinOrFold++
-		}
-	}
-
-	// Everyone is folded or all-in ⇒ round ends
-	if alive > 0 && alive == allinOrFold {
+	// 1) If there are no INHAND players left (everyone is ALLIN or FOLDED),
+	// then no more betting is possible on this street.
+	if e.everyoneAllInOrFolded() {
 		return true
 	}
 
-	// Every INHAND player must have acted at least once
+	// 2) Otherwise, every INHAND player must have acted at least once
 	for _, p := range e.Table.Players {
 		if p == nil || p.playerState != INHAND {
 			continue
@@ -758,7 +804,7 @@ func (e *Engine) advanceStreet() error {
 		return fmt.Errorf("unknown phase: %s", e.Table.Phase)
 	}
 
-	// Auto-run remaining streets if everyone is all-in or folded.
+	// 🔥 Auto-run remaining streets if everyone is all-in or folded.
 	// Once we hit SHOWDOWN/WAITING this won't recurse further.
 	if e.Table.Phase != SHOWDOWN && e.Table.Phase != WAITING && e.everyoneAllInOrFolded() {
 		log.Printf("[ENGINE] All players all-in/folded; auto-advancing from phase=%s", e.Table.Phase)
