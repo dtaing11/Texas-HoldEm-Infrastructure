@@ -94,6 +94,41 @@ func shuffle(deck []Card) {
 	}
 }
 
+// CanPlayerAct returns true if this player is the one to act and is not
+// already folded or all-in, and the hand is actually running.
+func (e *Engine) CanPlayerAct(playerID string) bool {
+	if e.Table == nil {
+		return false
+	}
+	// hand must be running
+	if e.Table.Phase == WAITING || e.Table.Phase == SHOWDOWN {
+		return false
+	}
+
+	// find seat
+	idx := e.findPlayerIdx(playerID)
+	if idx < 0 {
+		return false
+	}
+
+	// must be the one to act
+	if idx != e.toActIdx {
+		return false
+	}
+
+	p := e.Table.Players[idx]
+	if p == nil {
+		return false
+	}
+
+	// cannot act if already folded or all-in
+	if p.playerState == FOLDED || p.playerState == ALLIN {
+		return false
+	}
+
+	return true
+}
+
 // pops top n cards from CardStack (top = end of slice)
 func (e *Engine) draw(n int) []Card {
 	if len(e.Table.CardStack) < n {
@@ -147,6 +182,7 @@ func (e *Engine) firstSeatWithChips() int {
 	return -1
 }
 
+// nextSeatWithChips finds the next seat with chips, starting from "from".
 func (e *Engine) nextSeatWithChips(from int) int {
 	n := len(e.Table.Players)
 	if n == 0 {
@@ -188,6 +224,34 @@ func (e *Engine) stillContesting() []*Player {
 }
 
 func (e *Engine) leftOf(idx int) int { return e.nextIdx(idx) }
+
+// everyoneAllInOrFolded returns true if all remaining contestants are either
+// ALLIN or FOLDED (no INHAND player with chips left to act).
+func (e *Engine) everyoneAllInOrFolded() bool {
+	alive := 0
+	allinOrFold := 0
+
+	for _, p := range e.Table.Players {
+		if p == nil {
+			continue
+		}
+
+		if p.playerState == FOLDED {
+			allinOrFold++
+			continue
+		}
+
+		// still in the hand
+		if p.playerState == INHAND || p.playerState == ALLIN {
+			alive++
+			if p.playerState == ALLIN {
+				allinOrFold++
+			}
+		}
+	}
+
+	return alive > 0 && alive == allinOrFold
+}
 
 // ---------- Hand lifecycle ----------
 
@@ -235,9 +299,7 @@ func (e *Engine) StartHand() error {
 	// Reset board/hand-wide table state
 	e.Table.ResetHand()
 
-	// 🔧 IMPORTANT: reset per-player state for this new hand
-	// so that players who folded or went all-in last hand
-	// can play again if they still have chips.
+	// reset per-player state for this new hand
 	e.resetPerHandPlayerState()
 
 	// Rotate dealer button among seats that have chips.
@@ -566,6 +628,15 @@ func (e *Engine) advanceStreet() error {
 	default:
 		return fmt.Errorf("unknown phase: %s", e.Table.Phase)
 	}
+
+	// 🔥 Auto-run remaining streets if everyone is all-in or folded.
+	// Once we hit SHOWDOWN/WAITING this won't recurse further.
+	if e.Table.Phase != SHOWDOWN && e.Table.Phase != WAITING && e.everyoneAllInOrFolded() {
+		log.Printf("[ENGINE] All players all-in/folded; auto-advancing from phase=%s", e.Table.Phase)
+		e.toActIdx = -1
+		return e.advanceStreet()
+	}
+
 	return nil
 }
 

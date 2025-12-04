@@ -55,12 +55,19 @@ type StatePayload struct {
 	State *PublicState `json:"state"`
 }
 
+// ErrorPayload is used to tell a client their action was invalid and they must retry.
+type ErrorPayload struct {
+	Type  string `json:"type"`  // "retry"
+	Error string `json:"error"` // human-readable error from engine
+}
+
 // PublicState is per-client filtered view.
 type PublicState struct {
 	Table    *game.Table `json:"table"`
 	Pot      int         `json:"pot"`
 	Phase    game.Phase  `json:"phase"`
 	Board    []game.Card `json:"board"`
+	ToCall   int         `json:"ToCall"`
 	ToActIdx int         `json:"toActIdx"`
 	Hand     int         `json:"hand"`
 }
@@ -237,6 +244,7 @@ func (tb *tableBinding) buildPublicStateFor(c *Client) *PublicState {
 		Phase:    tb.Table.Phase,
 		Board:    tb.Table.CardOpen,
 		ToActIdx: tb.Engine.ToActIndex(),
+		ToCall:   tb.Engine.MinRaise,
 		Hand:     tb.handCounter,
 	}
 }
@@ -360,6 +368,16 @@ func (c *Client) handlePlayerAct(msg inboundMessage) {
 	log.Printf("[ws] handlePlayerAct: player=%s action=%v amount=%d",
 		c.playerID, msg.Action, msg.Amount)
 
+	// 🔒 SERVER-SIDE GATE:
+	// If the engine says this player cannot act (already folded/all-in,
+	// not their turn, hand not running, etc.), ignore the request.
+	if !tb.Engine.CanPlayerAct(c.playerID) {
+		log.Printf("[ws] ignoring act from %s: CanPlayerAct=false (phase=%s, toActIdx=%d)",
+			c.playerID, tb.Table.Phase, tb.Engine.ToActIndex())
+		tb.broadcastStateLocked()
+		return
+	}
+
 	prevPhase := tb.Table.Phase
 
 	err := tb.Engine.Act(game.ActRequest{
@@ -368,8 +386,11 @@ func (c *Client) handlePlayerAct(msg inboundMessage) {
 		Amount:   msg.Amount,
 	})
 	if err != nil {
+		// This should now mostly catch truly bad requests (e.g. illegal raise size),
+		// not "already folded" / "not your turn".
 		log.Printf("[ws] player act error: table=%s player=%s err=%v",
 			tb.Table.ID, c.playerID, err)
+		tb.broadcastStateLocked()
 		return
 	}
 
@@ -433,6 +454,20 @@ func (c *Client) handleHostAct(msg inboundMessage) {
 	})
 	if err != nil {
 		log.Printf("[HOST_LOGIC] host_act error: target=%s err=%v", msg.Player, err)
+
+		// 🔥 Send a retry message back to the host so UI can show error.
+		payload := ErrorPayload{
+			Type:  "retry",
+			Error: err.Error(),
+		}
+		if data, mErr := json.Marshal(payload); mErr != nil {
+			log.Printf("[ws] marshal retry error (host): %v", mErr)
+		} else {
+			select {
+			case c.send <- data:
+			default:
+			}
+		}
 		return
 	}
 
