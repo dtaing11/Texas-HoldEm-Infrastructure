@@ -374,6 +374,7 @@ func (c *Client) handlePlayerAct(msg inboundMessage) {
 
 	prevPhase := tb.Table.Phase
 
+	// Try the requested action first
 	err := tb.Engine.Act(game.ActRequest{
 		PlayerID: c.playerID,
 		Action:   msg.Action,
@@ -384,11 +385,39 @@ func (c *Client) handlePlayerAct(msg inboundMessage) {
 		// like ErrHandNotRunning / ErrNoSuchPlayer.
 		log.Printf("[ws] player act error: table=%s player=%s err=%v",
 			tb.Table.ID, c.playerID, err)
+
+		foldReq := game.ActRequest{
+			PlayerID: c.playerID,
+			Action:   game.FOLD, // adjust if your constant name differs
+			Amount:   0,
+		}
+
+		if foldErr := tb.Engine.Act(foldReq); foldErr != nil {
+			log.Printf("[ws] auto-fold failed: table=%s player=%s err=%v",
+				tb.Table.ID, c.playerID, foldErr)
+			// still broadcast whatever state we’re in
+			tb.broadcastStateLocked()
+			return
+		}
+
+		// Check if the forced fold ended the hand
+		if prevPhase != game.WAITING && tb.Table.Phase == game.WAITING {
+			log.Printf("[HOST_LOGIC] Hand #%d finished (via auto-fold).", tb.handCounter)
+			tb.handCounter++
+
+			if tb.canStartHandLocked() {
+				log.Printf("[HOST_LOGIC] Auto-starting hand #%d (post-hand via auto-fold)", tb.handCounter)
+				if err := tb.Engine.StartHand(); err != nil {
+					log.Printf("[HOST_LOGIC] StartHand error (post-hand via auto-fold): %v", err)
+				}
+			}
+		}
+
 		tb.broadcastStateLocked()
 		return
 	}
 
-	// Detect hand end (transition to WAITING).
+	// Normal successful action path
 	if prevPhase != game.WAITING && tb.Table.Phase == game.WAITING {
 		log.Printf("[HOST_LOGIC] Hand #%d finished.", tb.handCounter)
 		tb.handCounter++
