@@ -183,53 +183,6 @@ func (e *Engine) ResetGame(startingChips int) {
 	log.Printf("[ENGINE] ResetGame: startingChips=%d", startingChips)
 
 	// Clear per-hand table state
-	e.Table.ResetHand()
-	e.Table.Phase = WAITING
-	e.Table.CardOpen = nil
-	e.Table.CardStack = nil
-
-	// Reset engine-wide bookkeeping
-	e.Pot = 0
-	e.roundBets = make(map[string]int)
-	e.totalContrib = make(map[string]int)
-	e.actedThisStreet = make(map[string]bool)
-	e.highestThisStreet = 0
-	e.openAction = false
-	e.lastAggressorIdx = -1
-	e.toActIdx = -1
-	e.MinRaise = e.BigBlind
-	e.DealerBtn = -1 // force StartHand to pick a fresh dealer
-
-	// Reset each player's chips; keep seats but put everyone
-	// back to the starting stack.
-	for _, p := range e.Table.Players {
-		if p == nil {
-			continue
-		}
-		p.Chips = startingChips
-	}
-
-	// Re-init per-hand player state (cards + INHAND/FOLDED) based on chips
-	e.resetPerHandPlayerState()
-
-	log.Printf("[ENGINE] ResetGame done: phase=%s pot=%d", e.Table.Phase, e.Pot)
-}
-
-// ResetGame puts the engine/table into a clean state:
-//
-// - All seated players get `startingChips`
-// - Pot and betting state cleared
-// - Phase set to WAITING
-// - Board cleared
-// - Dealer button reset so the next hand can re-pick a dealer
-func (e *Engine) ResetGame(startingChips int) {
-	if e.Table == nil {
-		return
-	}
-
-	log.Printf("[ENGINE] ResetGame: startingChips=%d", startingChips)
-
-	// Clear per-hand table state
 	e.Table.ResetHand()     // your existing helper
 	e.Table.Phase = WAITING // back to "no active hand"
 	e.Table.CardOpen = nil  // clear board
@@ -357,28 +310,6 @@ func (e *Engine) stillContesting() []*Player {
 }
 
 func (e *Engine) leftOf(idx int) int { return e.nextIdx(idx) }
-
-// normalizeToActIdx ensures toActIdx is either -1 or a seat that can still act.
-func (e *Engine) normalizeToActIdx() {
-	if e.Table == nil {
-		e.toActIdx = -1
-		return
-	}
-	n := len(e.Table.Players)
-	if e.toActIdx < 0 || e.toActIdx >= n {
-		e.toActIdx = -1
-		return
-	}
-	p := e.Table.Players[e.toActIdx]
-	if p == nil || p.playerState != INHAND || p.Chips <= 0 {
-		next := e.nextIdx(e.toActIdx)
-		if next == e.toActIdx {
-			e.toActIdx = -1
-		} else {
-			e.toActIdx = next
-		}
-	}
-}
 
 // everyoneAllInOrFolded returns true iff there are no INHAND players left:
 // every non-nil, non-folded player is ALLIN.
