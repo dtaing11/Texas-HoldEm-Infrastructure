@@ -2,11 +2,9 @@
 package game
 
 import (
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
-	"math/big"
 	"sort"
 	"strings"
 )
@@ -21,150 +19,8 @@ var (
 	ErrRaiseTooSmall   = errors.New("raise below minimum")
 )
 
-// ---------- Public engine types ----------
-
-type Engine struct {
-	Table      *Table
-	DealerBtn  int // index into Table.Players
-	SmallBlind int
-	BigBlind   int
-	MinRaise   int // dynamic; resets each street to BB (or last raise size)
-	Pot        int
-
-	toActIdx          int             // index into Table.Players
-	roundBets         map[string]int  // chips put in this betting round (street)
-	totalContrib      map[string]int  // chips contributed this hand (for side pots)
-	actedThisStreet   map[string]bool // has this player taken an action on this street?
-	highestThisStreet int             // amount to call on this street
-	lastAggressorIdx  int             // index into Players; used to detect round close
-	openAction        bool            // has anyone bet/raised this street
-	evaluator         Evaluator       // hand ranking
-}
-
-// Evaluator offers a 7-card hand rank comparison. Higher is better.
-type Evaluator interface {
-	Rank7(hole [2]Card, board []Card) HandRank
-}
-
-// HandRank is a comparable numeric rank (bigger is stronger).
-type HandRank uint64
-
-// ---------- Construction ----------
-
-func NewEngine(t *Table, sb, bb int) *Engine {
-	return &Engine{
-		Table:           t,
-		SmallBlind:      sb,
-		BigBlind:        bb,
-		MinRaise:        bb, // min raise starts as big blind
-		DealerBtn:       -1, // sentinel: no dealer yet
-		toActIdx:        -1,
-		roundBets:       make(map[string]int),
-		totalContrib:    make(map[string]int),
-		actedThisStreet: make(map[string]bool),
-		evaluator:       &SimpleEvaluator{}, // replace with a stronger one if desired
-	}
-}
-
 func (e *Engine) SetEvaluator(ev Evaluator) {
 	e.evaluator = ev
-}
-
-// ---------- Deck / dealing utilities ----------
-
-var ranks = []string{"2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"}
-var suits = []Suit{HEART, DIAMOND, CLUB, SPADE}
-
-func newDeck() []Card {
-	d := make([]Card, 0, 52)
-	for _, s := range suits {
-		for _, r := range ranks {
-			d = append(d, Card{Rank: r, Suit: s})
-		}
-	}
-	return d
-}
-
-func shuffle(deck []Card) {
-	// Fisher–Yates with crypto/rand
-	for i := len(deck) - 1; i > 0; i-- {
-		nBig, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
-		j := int(nBig.Int64())
-		deck[i], deck[j] = deck[j], deck[i]
-	}
-}
-
-// ---------- Turn / acting helpers ----------
-
-// normalizeToActIdx ensures toActIdx either points to a player who can act
-// (INHAND with chips) or is set to -1 if nobody can act.
-func (e *Engine) normalizeToActIdx() {
-	if e.Table == nil {
-		e.toActIdx = -1
-		return
-	}
-
-	// No one can act when the hand isn't running.
-	if e.Table.Phase == WAITING || e.Table.Phase == SHOWDOWN {
-		e.toActIdx = -1
-		return
-	}
-
-	// See if there is anyone who can actually act.
-	hasActable := false
-	for _, p := range e.Table.Players {
-		if p != nil && p.playerState == INHAND && p.Chips > 0 {
-			hasActable = true
-			break
-		}
-	}
-	if !hasActable {
-		// Everyone is either all-in or folded ⇒ no one to act.
-		e.toActIdx = -1
-		return
-	}
-
-	// If toActIdx is out of range, pick the first actable player left of dealer.
-	if e.toActIdx < 0 || e.toActIdx >= len(e.Table.Players) {
-		e.toActIdx = e.nextIdx(e.DealerBtn)
-		return
-	}
-
-	// If current toActIdx points at someone who cannot act, move to the next.
-	p := e.Table.Players[e.toActIdx]
-	if p == nil || p.playerState != INHAND || p.Chips <= 0 {
-		e.toActIdx = e.nextIdx(e.toActIdx)
-	}
-}
-
-// CanPlayerAct returns true if this player is the one to act and the hand is active.
-// It also normalizes toActIdx so it never points at an ALLIN/FOLDED/busted seat.
-func (e *Engine) CanPlayerAct(playerID string) bool {
-	if e.Table == nil {
-		return false
-	}
-
-	// Keep toActIdx sane before checking.
-	e.normalizeToActIdx()
-
-	if e.Table.Phase == WAITING || e.Table.Phase == SHOWDOWN {
-		return false
-	}
-
-	// find seat
-	idx := e.findPlayerIdx(playerID)
-	if idx < 0 {
-		return false
-	}
-
-	// If normalizeToActIdx found no actable players, toActIdx will be -1.
-	if e.toActIdx < 0 || e.toActIdx >= len(e.Table.Players) {
-		return false
-	}
-
-	// From the server's POV, the only rule we enforce is "is it your turn?"
-	// The engine's Act() still handles folds/all-ins/etc.
-	return idx == e.toActIdx
 }
 
 // ResetGame puts the engine/table into a clean state:
@@ -214,39 +70,7 @@ func (e *Engine) ResetGame(startingChips int) {
 	log.Printf("[ENGINE] ResetGame done: phase=%s pot=%d", e.Table.Phase, e.Pot)
 }
 
-// pops top n cards from CardStack (top = end of slice)
-func (e *Engine) draw(n int) []Card {
-	if len(e.Table.CardStack) < n {
-		return nil
-	}
-	top := e.Table.CardStack[len(e.Table.CardStack)-n:]
-	e.Table.CardStack = e.Table.CardStack[:len(e.Table.CardStack)-n]
-	return top
-}
-
-func (e *Engine) burn() { _ = e.draw(1) }
-
 // ---------- Seating helpers ----------
-
-// nextIdx is for ACTION TURN ORDER within a hand.
-// Only players currently INHAND (not folded, not all-in) will get a turn.
-func (e *Engine) nextIdx(i int) int {
-	n := len(e.Table.Players)
-	if n == 0 {
-		return -1
-	}
-	for step := 1; step <= n; step++ {
-		j := (i + step) % n
-		p := e.Table.Players[j]
-		if p == nil {
-			continue
-		}
-		if p.playerState == INHAND && p.Chips > 0 {
-			return j
-		}
-	}
-	return i
-}
 
 // For dealer/button rotation we only care that the seat has a player with chips,
 // regardless of last-hand INHAND/FOLDED/ALLIN state.
@@ -308,8 +132,6 @@ func (e *Engine) stillContesting() []*Player {
 	return out
 }
 
-func (e *Engine) leftOf(idx int) int { return e.nextIdx(idx) }
-
 // everyoneAllInOrFolded returns true if all remaining contestants are either
 // ALLIN or FOLDED (no INHAND player with chips left to act).
 func (e *Engine) everyoneAllInOrFolded() bool {
@@ -357,19 +179,6 @@ func (e *Engine) resetPerHandPlayerState() {
 			p.playerState = FOLDED
 		}
 	}
-}
-
-func (e *Engine) ToActIndex() int {
-	if e.Table == nil {
-		return -1
-	}
-
-	e.normalizeToActIdx()
-
-	if e.toActIdx < 0 || e.toActIdx >= len(e.Table.Players) {
-		return -1
-	}
-	return e.toActIdx
 }
 
 func (e *Engine) StartHand() error {

@@ -88,3 +88,48 @@ func (t *Table) ResetHand() {
 		p.Cards = [2]Card{}
 	}
 }
+
+// ---------- Public engine types ----------
+
+type Engine struct {
+	Table      *Table
+	DealerBtn  int // index into Table.Players
+	SmallBlind int
+	BigBlind   int
+	MinRaise   int // dynamic; resets each street to BB (or last raise size)
+	Pot        int
+
+	toActIdx          int             // index into Table.Players
+	roundBets         map[string]int  // chips put in this betting round (street)
+	totalContrib      map[string]int  // chips contributed this hand (for side pots)
+	actedThisStreet   map[string]bool // has this player taken an action on this street?
+	highestThisStreet int             // amount to call on this street
+	lastAggressorIdx  int             // index into Players; used to detect round close
+	openAction        bool            // has anyone bet/raised this street
+	evaluator         Evaluator       // hand ranking
+}
+
+// Evaluator offers a 7-card hand rank comparison. Higher is better.
+type Evaluator interface {
+	Rank7(hole [2]Card, board []Card) HandRank
+}
+
+// HandRank is a comparable numeric rank (bigger is stronger).
+type HandRank uint64
+
+// ---------- Construction ----------
+
+func NewEngine(t *Table, sb, bb int) *Engine {
+	return &Engine{
+		Table:           t,
+		SmallBlind:      sb,
+		BigBlind:        bb,
+		MinRaise:        bb, // min raise starts as big blind
+		DealerBtn:       -1, // sentinel: no dealer yet
+		toActIdx:        -1,
+		roundBets:       make(map[string]int),
+		totalContrib:    make(map[string]int),
+		actedThisStreet: make(map[string]bool),
+		evaluator:       &SimpleEvaluator{}, // replace with a stronger one if desired
+	}
+}
