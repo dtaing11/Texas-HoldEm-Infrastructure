@@ -8,16 +8,19 @@ from threading import Event, Lock
 from dotenv import load_dotenv
 from websocket import WebSocketApp, WebSocketConnectionClosedException
 import matplotlib.pyplot as plt
+import os
 
-
+load_dotenv()
+BASEURL = os.getenv("BASEURL")
+API_KEY = os.getenv("APIKEY")
+TABLE_ID = os.getenv("TABLEID")
+STARTKEY = os.getenv("STARTKEY")
+HOST_ID = "Host"
 WS_URL_TEMPLATE = (
-    "ws://localhost:8080/ws"
+    BASEURL +
     "?apiKey={apiKey}&table={table}&player={player}&startKey={startKey}"
 )
 
-api_key = "dev"
-table_id = "table-1"
-start_key = "supersecret"
 
 # --------- Shared state for plotting ---------
 chip_history = {}  # {player_id: {"hands": [...], "chips": [...]} }
@@ -142,10 +145,10 @@ def main():
     host_id = "host-1"
 
     url = WS_URL_TEMPLATE.format(
-        apiKey=api_key,
-        table=table_id,
-        player=host_id,
-        startKey=start_key,
+        apiKey=API_KEY,
+        table=TABLE_ID,
+        player=HOST_ID,
+        startKey=STARTKEY,
     )
     print(f"[HOST] Connecting to {url}")
 
